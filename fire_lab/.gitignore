@@ -43,6 +43,10 @@ docker/.container.cfg
 docker/artifacts/
 *.tmp
 
+# FIRe reproduction artifacts (datasets, checkpoints, training runs, evaluations)
+/experiments/*
+!/experiments/README.md
+
 # Doc Outputs
 **/docs/_build/*
 **/generated/*
@@ -52,6 +56,7 @@ _isaac_sim*
 _repo
 _build
 .lastformat
+/_gr00t/
 
 # RL-Games
 **/runs/*

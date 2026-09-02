@@ -7,7 +7,14 @@ import gymnasium as gym
 
 from . import agents
 from .forge_env import ForgeEnv
-from .forge_env_cfg import ForgeTaskGearMeshCfg, ForgeTaskNutThreadCfg, ForgeTaskPegInsertCfg
+from .forge_env_cfg import (
+    ForgeTaskGearMeshCfg,
+    ForgeTaskNutThreadCfg,
+    ForgeTaskPegInsertCfg,
+    ForgeTaskPegInsertCurriculumStage1Cfg,
+    ForgeTaskPegInsertCurriculumStage2Cfg,
+    ForgeTaskPegInsertCurriculumStage3Cfg,
+)
 
 ##
 # Register Gym environments.
@@ -22,6 +29,21 @@ gym.register(
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg_peg_insert.yaml",
     },
 )
+
+for stage, cfg_class in (
+    (1, ForgeTaskPegInsertCurriculumStage1Cfg),
+    (2, ForgeTaskPegInsertCurriculumStage2Cfg),
+    (3, ForgeTaskPegInsertCurriculumStage3Cfg),
+):
+    gym.register(
+        id=f"FireLab-BaseLine-Forge-PegInsert-Curriculum-Stage{stage}-Direct-v0",
+        entry_point=f"{__name__}.forge_env:ForgeEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{cfg_class.__module__}:{cfg_class.__name__}",
+            "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg_peg_insert.yaml",
+        },
+    )
 
 gym.register(
     id="FireLab-BaseLine-Forge-GearMesh-Direct-v0",

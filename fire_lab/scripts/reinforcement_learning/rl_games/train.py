@@ -30,6 +30,18 @@ parser.add_argument(
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--sigma", type=str, default=None, help="The policy's initial standard deviation.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument(
+    "--run_name",
+    type=str,
+    default=None,
+    help="Unique RL-Games run directory name. Defaults to the name in the agent configuration.",
+)
+parser.add_argument(
+    "--save_frequency",
+    type=int,
+    default=None,
+    help="Checkpoint save frequency in training iterations.",
+)
 parser.add_argument("--wandb-entity", type=str, default=None, help="the entity (team) of wandb's project")
 parser.add_argument("--wandb-project-name", type=str, default=None, help="the wandb's project name")
 parser.add_argument("--wandb-name", type=str, default=None, help="the name of wandb's run")
@@ -102,6 +114,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    # Keep the persisted agent configuration consistent with the runtime actor count.
+    agent_cfg["params"]["config"]["num_actors"] = env_cfg.scene.num_envs
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
         raise ValueError(
@@ -122,6 +136,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg["params"]["config"]["max_epochs"] = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg["params"]["config"]["max_epochs"]
     )
+    horizon_length = int(agent_cfg["params"]["config"]["horizon_length"])
+    max_epochs = int(agent_cfg["params"]["config"]["max_epochs"])
+    planned_sample_frames = int(env_cfg.scene.num_envs) * horizon_length * max_epochs
+    reference_sample_frames = 1_638_400
+    agent_cfg["params"]["config"]["planned_sample_frames"] = planned_sample_frames
+    agent_cfg["params"]["config"]["reference_sample_frames"] = reference_sample_frames
+    print(
+        "[INFO] Planned training samples: "
+        f"{env_cfg.scene.num_envs} envs x {horizon_length} horizon x {max_epochs} epochs "
+        f"= {planned_sample_frames:,} frames."
+    )
+    is_forge_peg_insert = getattr(getattr(env_cfg, "task", None), "name", None) == "peg_insert"
+    if is_forge_peg_insert and planned_sample_frames < reference_sample_frames:
+        print(
+            "[WARNING] Forge PegInsert sample budget is below the 1,638,400-frame reference "
+            f"({planned_sample_frames / reference_sample_frames:.2%}). Compare runs by sampled frames, not epochs."
+        )
+    if is_forge_peg_insert:
+        task_cfg = env_cfg.task
+        print(
+            "[INFO] Forge PegInsert curriculum: "
+            f"stage={getattr(task_cfg, 'curriculum_stage', 0)}, "
+            f"hand_noise={task_cfg.hand_init_pos_noise}, held_noise={task_cfg.held_asset_pos_noise}, "
+            f"force_threshold={task_cfg.contact_penalty_threshold_range} N, "
+            f"contact_scale={task_cfg.contact_penalty_scale}, "
+            f"engaged_scale={getattr(task_cfg, 'engaged_reward_scale', 1.0)}, "
+            f"success_scale={getattr(task_cfg, 'success_reward_scale', 1.0)}."
+        )
+    if args_cli.save_frequency is not None:
+        if args_cli.save_frequency <= 0:
+            raise ValueError("--save_frequency must be greater than zero.")
+        agent_cfg["params"]["config"]["save_frequency"] = args_cli.save_frequency
     if args_cli.checkpoint is not None:
         resume_path = retrieve_file_path(args_cli.checkpoint)
         agent_cfg["params"]["load_checkpoint"] = True
@@ -153,7 +199,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs
-    log_dir = agent_cfg["params"]["config"].get("full_experiment_name", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    if args_cli.run_name is not None:
+        if args_cli.run_name in {".", ".."} or os.path.basename(args_cli.run_name) != args_cli.run_name:
+            raise ValueError("--run_name must be a single directory name without path separators.")
+        log_dir = args_cli.run_name
+    else:
+        log_dir = agent_cfg["params"]["config"].get(
+            "full_experiment_name", datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        )
 
     full_log_path = os.path.join(log_root_path, log_dir)
     if args_cli.huggingface:

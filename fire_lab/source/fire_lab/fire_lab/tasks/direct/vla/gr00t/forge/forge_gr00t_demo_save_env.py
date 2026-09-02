@@ -20,6 +20,7 @@ import time
 import os
 import pandas as pd
 import sys
+from pathlib import Path
 from torchvision.io import write_video
 
 
@@ -35,6 +36,8 @@ class ForgeGr00tDemoSaveEnv(ForgeEnv):
         if self.demo_save_cfg:
             self.gr00t_data_buffers = [{} for _ in range(self.num_envs)]
             self.gr00t_img_buffers = [{} for _ in range(self.num_envs)]
+            self._pending_gr00t_transition = None
+            self._saved_episode_count = 0
 
             self._initialize_parquet_buffers()
             self._initialize_image_buffers()
@@ -89,14 +92,16 @@ class ForgeGr00tDemoSaveEnv(ForgeEnv):
         )
 
         rew_buf = torch.where(true_successes, 1.0, 0.0)
+        if self.cfg.is_demo_save:
+            self._commit_gr00t_transition(true_successes)
         # TODO: Add force limit penalty
 
         return rew_buf
     
     def _pre_physics_step(self, action):
         """Apply policy actions with smoothing."""
-        # Save last actions for gr00t data logging
-        self.last_actions = action.clone()
+        if self.cfg.is_demo_save:
+            self._capture_gr00t_transition(action)
         super()._pre_physics_step(action) # This changes action to smoothed action
 
     def _get_observations(self):
@@ -126,15 +131,6 @@ class ForgeGr00tDemoSaveEnv(ForgeEnv):
         obs_tensors = factory_utils.collapse_obs_dict(obs_dict, self.cfg.obs_order + ["prev_actions"])
         state_tensors = factory_utils.collapse_obs_dict(state_dict, self.cfg.state_order + ["prev_actions"])
 
-
-        if self.cfg.is_demo_save:
-
-            self._update_gr00t_observations(
-                eef_position=obs_dict["fingertip_pos"],
-                eef_quaternion=obs_dict["fingertip_quat"],
-                gripper_qpos=self.joint_pos[:, 7:9]
-            )
-
         return {"policy": obs_tensors, "critic": state_tensors}
 
 
@@ -148,6 +144,7 @@ class ForgeGr00tDemoSaveEnv(ForgeEnv):
                 video_dir=self.demo_save_cfg.video_dir,
             )
             self._initialize_parquet_buffers()
+            self._initialize_image_buffers()
 
     def _get_gr00t_observations(self):
         # This is for gr00t observations
@@ -167,6 +164,7 @@ class ForgeGr00tDemoSaveEnv(ForgeEnv):
         for env_id in range(self.num_envs):
             self.gr00t_data_buffers[env_id] = {
                 "observation.state": [],
+                "observation.force": [],
                 "action": [],
                 "timestamp": [],
                 "annotation.human.action.task_description": [],
@@ -176,6 +174,7 @@ class ForgeGr00tDemoSaveEnv(ForgeEnv):
                 "index": [],
                 "next.reward": [],
                 "next.done": [],
+                "episode.success": [],
             }
 
     def _initialize_image_buffers(self):
@@ -189,17 +188,50 @@ class ForgeGr00tDemoSaveEnv(ForgeEnv):
 
     def _save_gr00t_observations(self, data_dir: str, video_dir: str):
         """Saves the collected gr00t data and videos to the specified directories."""
-        # Prevent saving if no data collected: Initial reset
-        if len(self.gr00t_data_buffers[0]["observation.state"]) != self.max_episode_length - 2:
+        expected_frames = self.max_episode_length - 1
+        frame_counts = [len(buffer["observation.state"]) for buffer in self.gr00t_data_buffers]
+        if not any(frame_counts):
             print("No data collected for this episode. Skipping save.")
             return
 
-        for env_id in range(self.num_envs):
+        incomplete = [env_id for env_id, count in enumerate(frame_counts) if count != expected_frames]
+        if incomplete:
+            raise RuntimeError(
+                f"Incomplete demo buffers for environments {incomplete}: "
+                f"frame counts={frame_counts}, expected={expected_frames}."
+            )
+
+        successful_env_ids = [
+            env_id
+            for env_id, buffer in enumerate(self.gr00t_data_buffers)
+            if any(buffer["next.reward"])
+        ]
+        if not successful_env_ids:
+            print(f"No successful episodes in this batch ({self.num_envs} attempted); nothing saved.")
+            if self.demo_save_cfg.target_successful_episodes <= 0:
+                sys.exit(0)
+            return
+
+        data_path = Path(data_dir)
+        existing_ids = []
+        for path in data_path.glob("episode_*.parquet"):
+            try:
+                existing_ids.append(int(path.stem.rsplit("_", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+        next_episode_index = max(existing_ids, default=-1) + 1
+
+        for output_offset, env_id in enumerate(successful_env_ids):
+            episode_index = next_episode_index + output_offset
             # Save Datas
             df = pd.DataFrame(self.gr00t_data_buffers[env_id])
+            df["annotation.human.validity"] = True
+            df["episode.success"] = True
+            df["episode_index"] = episode_index
+            df["index"] = episode_index * expected_frames + np.arange(len(df), dtype=np.int64)
 
             gr00t_data_path = os.path.join(
-                data_dir, f"episode_{env_id:06d}.parquet"
+                data_dir, f"episode_{episode_index:06d}.parquet"
             )
             os.makedirs(os.path.dirname(gr00t_data_path), exist_ok=True)
 
@@ -208,78 +240,85 @@ class ForgeGr00tDemoSaveEnv(ForgeEnv):
             # Save Videos
             for camera_name, img_list in self.gr00t_img_buffers[env_id].items():
 
-                img_tensor = torch.stack(img_list, dim=0).to(device=self.device, dtype=torch.uint8) # (T, C, H, W)
+                img_tensor = torch.stack(img_list, dim=0).to(device="cpu", dtype=torch.uint8) # (T, H, W, C)
 
                 gr00t_video_path = os.path.join(
-                    video_dir[camera_name], f"episode_{env_id:06d}.mp4"
+                    video_dir[camera_name], f"episode_{episode_index:06d}.mp4"
                 )
                 os.makedirs(os.path.dirname(gr00t_video_path), exist_ok=True)
 
                 write_video(gr00t_video_path, img_tensor, fps=int(1/self.step_dt), video_codec="h264")
 
-
-        print(f"Saved {self.num_envs} episodes to {data_dir} and {video_dir}")
+        print(
+            f"Saved {len(successful_env_ids)} successful episodes out of "
+            f"{self.num_envs} attempts to {data_dir} and {video_dir}"
+        )
+        self._saved_episode_count += len(successful_env_ids)
         print(f"number of frames: {len(self.gr00t_data_buffers[0]['observation.state'])}")
-        print(f"Exiting program after saving gr00t data...")
+        target = self.demo_save_cfg.target_successful_episodes
+        if target > 0 and self._saved_episode_count < target:
+            print(f"collection progress: {self._saved_episode_count} / {target} successful episodes")
+            return
+        print("Exiting program after reaching the demonstration collection target...")
 
         # Quit Program
         sys.exit(0)
 
-    def _update_gr00t_observations(self, eef_position, eef_quaternion, gripper_qpos):
-
-        if self.episode_length_buf[0].item() == 0:
-            return # Skip the first step (reset step)
-
-        check_rot = self.cfg_task.name == "nut_thread"
-        true_successes = self._get_curr_successes(
-            success_threshold=self.cfg_task.success_threshold, check_rot=check_rot
+    def _capture_gr00t_transition(self, action):
+        """Capture the observation and action before physics so they are time-aligned."""
+        state = torch.cat(
+            (self.noisy_fingertip_pos, self.noisy_fingertip_quat, self.joint_pos[:, 7:9]), dim=-1
         )
-
-        state = torch.cat((eef_position, eef_quaternion, gripper_qpos), dim=-1)
-        arm_action = self.last_actions[:, :6]
+        arm_action = action[:, :6]
         gripper_action = torch.ones((self.num_envs, 1), device=self.device) # This Task forces gripper to be closed
-        action = torch.cat((arm_action, gripper_action), dim=-1) # rescale success_pred to [0, 1]
+        gr00t_action = torch.cat((arm_action, gripper_action), dim=-1)
 
-        # Get Camera Datas -> # (num_envs, height, width, channel)
-        left_camera_data = self._left_camera.data.output["rgb"].clone()
-        right_camera_data = self._right_camera.data.output["rgb"].clone()
-        wrist_camera_data = self._wrist_camera.data.output["rgb"].clone()
+        self._pending_gr00t_transition = {
+            "state": state.detach().cpu(),
+            "force": self.noisy_force.detach().cpu(),
+            "action": gr00t_action.detach().cpu(),
+            "step": self.episode_length_buf.detach().cpu().clone(),
+            "left_camera": self._left_camera.data.output["rgb"].detach().cpu().clone(),
+            "right_camera": self._right_camera.data.output["rgb"].detach().cpu().clone(),
+            "wrist_camera": self._wrist_camera.data.output["rgb"].detach().cpu().clone(),
+        }
 
-        print("================== Parquet Data Stats =================")
-        print(f"current / max: {self.episode_length_buf[0].item()} / {self.max_episode_length - 2}")
-        print(f"success / total: {true_successes.sum().item()} / {self.num_envs}")
+    def _commit_gr00t_transition(self, true_successes):
+        """Attach post-action outcome fields and append the pending transition."""
+        if self._pending_gr00t_transition is None:
+            raise RuntimeError("Demo transition outcome was computed without a pending observation/action.")
+
+        pending = self._pending_gr00t_transition
+        successes = true_successes.detach().cpu()
+
+        if pending["step"][0].item() % 10 == 0 or true_successes.any():
+            print("================== Parquet Data Stats =================")
+            print(f"current / max: {pending['step'][0].item()} / {self.max_episode_length - 2}")
+            print(f"success / total: {true_successes.sum().item()} / {self.num_envs}")
 
         for i in range(self.num_envs):
-            current_step_in_ep = self.episode_length_buf[i].item()
+            current_step_in_ep = pending["step"][i].item()
 
             # update data buffers
-            self.gr00t_data_buffers[i]["observation.state"].append(state[i].cpu().numpy().tolist())
-            self.gr00t_data_buffers[i]["action"].append(action[i].cpu().numpy().tolist()) # action[6] is success_pred
+            self.gr00t_data_buffers[i]["observation.state"].append(pending["state"][i].numpy().tolist())
+            self.gr00t_data_buffers[i]["observation.force"].append(pending["force"][i].numpy().tolist())
+            self.gr00t_data_buffers[i]["action"].append(pending["action"][i].numpy().tolist())
             self.gr00t_data_buffers[i]["timestamp"].append(round(current_step_in_ep * self.step_dt, 3))
             self.gr00t_data_buffers[i]["annotation.human.action.task_description"].append(0) # Task index 0
             self.gr00t_data_buffers[i]["task_index"].append(0)
-            self.gr00t_data_buffers[i]["annotation.human.validity"].append(true_successes[i].item())
+            self.gr00t_data_buffers[i]["annotation.human.validity"].append(False)
             self.gr00t_data_buffers[i]["episode_index"].append(i)
             self.gr00t_data_buffers[i]["index"].append(i * (self.max_episode_length - 1) + current_step_in_ep - 1)
-            
-            if true_successes[i]:
-                self.gr00t_data_buffers[i]["next.reward"].append(1.0)
-            else:
-                self.gr00t_data_buffers[i]["next.reward"].append(0.0)
-            
+            self.gr00t_data_buffers[i]["next.reward"].append(float(successes[i].item()))
             if current_step_in_ep == self.max_episode_length - 2: # Final Step of episode
                 self.gr00t_data_buffers[i]["next.done"].append(True)
             else:
                 self.gr00t_data_buffers[i]["next.done"].append(False)
+            self.gr00t_data_buffers[i]["episode.success"].append(False)
 
             # update image buffers
-            self.gr00t_img_buffers[i]["left_camera"].append(
-                left_camera_data[i]
-            )
-            self.gr00t_img_buffers[i]["right_camera"].append(
-                right_camera_data[i]
-            )
-            self.gr00t_img_buffers[i]["wrist_camera"].append(
-                wrist_camera_data[i]
-            )
+            self.gr00t_img_buffers[i]["left_camera"].append(pending["left_camera"][i])
+            self.gr00t_img_buffers[i]["right_camera"].append(pending["right_camera"][i])
+            self.gr00t_img_buffers[i]["wrist_camera"].append(pending["wrist_camera"][i])
 
+        self._pending_gr00t_transition = None

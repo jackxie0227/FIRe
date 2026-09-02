@@ -1076,12 +1076,12 @@ class FrankaTripleCamDataConfig(BaseDataConfig):
             GR00TTransform(
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
-                max_state_dim=64,  
+                max_state_dim=64,
                 max_action_dim=32,
             ),
         ]
         return ComposedModalityTransform(transforms=transforms)
-    
+
 
 ###########################################################################################
 

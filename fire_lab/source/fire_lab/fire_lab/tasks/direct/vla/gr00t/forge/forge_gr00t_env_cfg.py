@@ -5,6 +5,7 @@
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
@@ -21,11 +22,26 @@ OBS_DIM_CFG.update({"force_threshold": 1, "ft_force": 3})
 STATE_DIM_CFG.update({"force_threshold": 1, "ft_force": 3})
 
 
+_FIRE_LAB_ROOT = Path(__file__).resolve().parents[8]
+_EXPERIMENT_ROOT = Path(
+    os.environ.get("FIRE_EXPERIMENT_ROOT", _FIRE_LAB_ROOT / "experiments")
+).expanduser()
+_DEMO_DATASET_ROOT = Path(
+    os.environ.get(
+        "FIRE_DEMO_DATASET_ROOT", _EXPERIMENT_ROOT / "sim_demos" / "forge"
+    )
+).expanduser()
+
+
 @dataclass
 class DemoSaveCfg:
 
-    dataset_path: str = "/home/hyunho_RCI/datasets/gr00t-rl/forge/peg_insert"
+    dataset_path: str = str(_DEMO_DATASET_ROOT / "peg_insert")
     chunk_id: str = "chunk-000"
+    # Zero saves one synchronized environment batch and exits. A positive value
+    # keeps the simulator alive until at least this many successful episodes have
+    # been written during the current run.
+    target_successful_episodes: int = 0
 
     video_dir: dict = field(init=False)
     data_dir: str = field(init=False)
@@ -40,15 +56,15 @@ class DemoSaveCfg:
 
 @dataclass
 class DemoSavePegInsert(DemoSaveCfg):
-    dataset_path: str = "/home/hyunho_RCI/datasets/gr00t-rl/forge/peg_insert"
+    dataset_path: str = str(_DEMO_DATASET_ROOT / "peg_insert")
 
 @dataclass
 class DemoSaveGearMesh(DemoSaveCfg):
-    dataset_path: str = "/home/hyunho_RCI/datasets/gr00t-rl/forge/gear_mesh"
+    dataset_path: str = str(_DEMO_DATASET_ROOT / "gear_mesh")
 
 @dataclass
 class DemoSaveNutThread(DemoSaveCfg):
-    dataset_path: str = "/home/hyunho_RCI/datasets/gr00t-rl/forge/nut_thread"
+    dataset_path: str = str(_DEMO_DATASET_ROOT / "nut_thread")
 
 
 @configclass

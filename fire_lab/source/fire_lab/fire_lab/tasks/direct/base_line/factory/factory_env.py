@@ -383,9 +383,12 @@ class FactoryEnv(DirectRLEnv):
 
     def _log_factory_metrics(self, rew_dict, curr_successes):
         """Keep track of episode statistics and log rewards."""
+        log = self.extras.setdefault("log", {})
         # Only log episode success rates at the end of an episode.
         if torch.any(self.reset_buf):
-            self.extras["successes"] = torch.count_nonzero(curr_successes) / self.num_envs
+            episode_success_rate = torch.count_nonzero(curr_successes) / self.num_envs
+            self.extras["successes"] = episode_success_rate
+            log["Metrics/episode_success_rate"] = episode_success_rate
 
         # Get the time at which an episode first succeeds.
         first_success = torch.logical_and(curr_successes, torch.logical_not(self.ep_succeeded))
@@ -398,6 +401,7 @@ class FactoryEnv(DirectRLEnv):
         if len(nonzero_success_ids) > 0:  # Only log for successful episodes.
             success_times = self.ep_success_times[nonzero_success_ids].sum() / len(nonzero_success_ids)
             self.extras["success_times"] = success_times
+            log["Metrics/mean_first_success_step"] = success_times
 
         for rew_name, rew in rew_dict.items():
             self.extras[f"logs_rew_{rew_name}"] = rew.mean()
@@ -480,8 +484,8 @@ class FactoryEnv(DirectRLEnv):
             "kp_fine": 1.0,
             "action_penalty_ee": -self.cfg_task.action_penalty_ee_scale,
             "action_grad_penalty": -self.cfg_task.action_grad_penalty_scale,
-            "curr_engaged": 1.0,
-            "curr_success": 1.0,
+            "curr_engaged": getattr(self.cfg_task, "engaged_reward_scale", 1.0),
+            "curr_success": getattr(self.cfg_task, "success_reward_scale", 1.0),
         }
         return rew_dict, rew_scales
 

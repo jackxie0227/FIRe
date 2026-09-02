@@ -10,7 +10,15 @@ from isaaclab.utils import configclass
 
 from fire_lab.tasks.direct.base_line.factory.factory_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG, CtrlCfg, FactoryEnvCfg, ObsRandCfg
 from .forge_events import randomize_dead_zone
-from .forge_tasks_cfg import ForgeGearMesh, ForgeNutThread, ForgePegInsert, ForgeTask
+from .forge_tasks_cfg import (
+    ForgeGearMesh,
+    ForgeNutThread,
+    ForgePegInsert,
+    ForgePegInsertCurriculumStage1,
+    ForgePegInsertCurriculumStage2,
+    ForgePegInsertCurriculumStage3,
+    ForgeTask,
+)
 
 OBS_DIM_CFG.update({"force_threshold": 1, "ft_force": 3})
 
@@ -131,6 +139,21 @@ class ForgeTaskPegInsertCfg(ForgeEnvCfg):
     task_name = "peg_insert"
     task = ForgePegInsert()
     episode_length_s = 10.0
+
+
+@configclass
+class ForgeTaskPegInsertCurriculumStage1Cfg(ForgeTaskPegInsertCfg):
+    task = ForgePegInsertCurriculumStage1()
+
+
+@configclass
+class ForgeTaskPegInsertCurriculumStage2Cfg(ForgeTaskPegInsertCfg):
+    task = ForgePegInsertCurriculumStage2()
+
+
+@configclass
+class ForgeTaskPegInsertCurriculumStage3Cfg(ForgeTaskPegInsertCfg):
+    task = ForgePegInsertCurriculumStage3()
 
 
 @configclass

@@ -74,7 +74,7 @@ class ForgeEnv(FactoryEnv):
         self.noisy_fingertip_quat = torch_utils.quat_mul(
             self.fingertip_midpoint_quat, torch_utils.quat_from_angle_axis(rot_noise_angle, rot_noise_axis)
         )
-        self.noisy_fingertip_quat[:, [0, 3]] = 0.0
+        self.noisy_fingertip_quat = forge_utils.project_quat_to_downward_yaw(self.noisy_fingertip_quat)
         self.noisy_fingertip_quat = self.noisy_fingertip_quat * self.flip_quats.unsqueeze(-1)
 
         # Repeat finite differencing with noisy fingertip positions.
@@ -150,7 +150,7 @@ class ForgeEnv(FactoryEnv):
         pos_actions = self.actions[:, 0:3]
         pos_actions = pos_actions @ torch.diag(torch.tensor(self.cfg.ctrl.pos_action_bounds, device=self.device))
 
-        rot_actions = self.actions[:, 3:6]
+        rot_actions = self.actions[:, 3:6].clone()
         rot_actions = rot_actions @ torch.diag(torch.tensor(self.cfg.ctrl.rot_action_bounds, device=self.device))
 
         # Step (1): Compute desired pose targets in EE frame.
@@ -162,17 +162,9 @@ class ForgeEnv(FactoryEnv):
 
         # Assumes joint limit is in (+x, -y)-quadrant of world frame.
         rot_actions[:, 2] = np.deg2rad(-180.0) + np.deg2rad(270.0) * (rot_actions[:, 2] + 1.0) / 2.0  # Joint limit.
-        # (1.c) Get desired orientation target.
-        bolt_frame_quat = torch_utils.quat_from_euler_xyz(
-            roll=rot_actions[:, 0], pitch=rot_actions[:, 1], yaw=rot_actions[:, 2]
-        )
-
-        rot_180_euler = torch.tensor([np.pi, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1)
-        quat_bolt_to_ee = torch_utils.quat_from_euler_xyz(
-            roll=rot_180_euler[:, 0], pitch=rot_180_euler[:, 1], yaw=rot_180_euler[:, 2]
-        )
-
-        ctrl_target_fingertip_preclipped_quat = torch_utils.quat_mul(quat_bolt_to_ee, bolt_frame_quat)
+        # (1.c) Build a legal downward target. Roll/pitch policy actions intentionally have no effect.
+        ctrl_target_fingertip_preclipped_quat = forge_utils.downward_quat_from_yaw(rot_actions[:, 2])
+        _, _, desired_yaw = forge_utils.euler_xyz_from_quat_wxyz(ctrl_target_fingertip_preclipped_quat)
 
         # Step (2): Clip targets if they are too far from current EE pose.
         # (2.a): Clip position targets.
@@ -180,42 +172,9 @@ class ForgeEnv(FactoryEnv):
         pos_error_clipped = torch.clip(self.delta_pos, -self.pos_threshold, self.pos_threshold)
         ctrl_target_fingertip_midpoint_pos = self.fingertip_midpoint_pos + pos_error_clipped
 
-        # (2.b) Clip orientation targets. Use Euler angles. We assume we are near upright, so
-        # clipping yaw will effectively cause slow motions. When we clip, we also need to make
-        # sure we avoid the joint limit.
-
-        # (2.b.i) Get current and desired Euler angles.
-        curr_roll, curr_pitch, curr_yaw = torch_utils.get_euler_xyz(self.fingertip_midpoint_quat)
-        desired_roll, desired_pitch, desired_yaw = torch_utils.get_euler_xyz(ctrl_target_fingertip_preclipped_quat)
-        desired_xyz = torch.stack([desired_roll, desired_pitch, desired_yaw], dim=1)
-
-        # (2.b.ii) Correct the direction of motion to avoid joint limit.
-        # Map yaws between [-125, 235] degrees (so that angles appear on a continuous span uninterrupted by the joint limit).
-        curr_yaw = factory_utils.wrap_yaw(curr_yaw)
-        desired_yaw = factory_utils.wrap_yaw(desired_yaw)
-
-        # (2.b.iii) Clip motion in the correct direction.
-        self.delta_yaw = desired_yaw - curr_yaw  # Used later for action_penalty.
-        clipped_yaw = torch.clip(self.delta_yaw, -self.rot_threshold[:, 2], self.rot_threshold[:, 2])
-        desired_xyz[:, 2] = curr_yaw + clipped_yaw
-
-        # (2.b.iv) Clip roll and pitch.
-        desired_roll = torch.where(desired_roll < 0.0, desired_roll + 2 * torch.pi, desired_roll)
-        desired_pitch = torch.where(desired_pitch < 0.0, desired_pitch + 2 * torch.pi, desired_pitch)
-
-        delta_roll = desired_roll - curr_roll
-        clipped_roll = torch.clip(delta_roll, -self.rot_threshold[:, 0], self.rot_threshold[:, 0])
-        desired_xyz[:, 0] = curr_roll + clipped_roll
-
-        curr_pitch = torch.where(curr_pitch > torch.pi, curr_pitch - 2 * torch.pi, curr_pitch)
-        desired_pitch = torch.where(desired_pitch > torch.pi, desired_pitch - 2 * torch.pi, desired_pitch)
-
-        delta_pitch = desired_pitch - curr_pitch
-        clipped_pitch = torch.clip(delta_pitch, -self.rot_threshold[:, 1], self.rot_threshold[:, 1])
-        desired_xyz[:, 1] = curr_pitch + clipped_pitch
-
-        ctrl_target_fingertip_midpoint_quat = torch_utils.quat_from_euler_xyz(
-            roll=desired_xyz[:, 0], pitch=desired_xyz[:, 1], yaw=desired_xyz[:, 2]
+        # (2.b) Clip in a continuous angular interval, including the roll -pi/+pi boundary.
+        ctrl_target_fingertip_midpoint_quat, self.delta_yaw = forge_utils.clip_downward_orientation(
+            self.fingertip_midpoint_quat, desired_yaw, self.rot_threshold, factory_utils.wrap_yaw
         )
 
         self.generate_ctrl_signals(
@@ -261,7 +220,7 @@ class ForgeEnv(FactoryEnv):
         for rew_name, rew in rew_dict.items():
             rew_buf += rew_dict[rew_name] * rew_scales[rew_name]
 
-        self._log_forge_metrics(rew_dict, policy_success_pred)
+        self._log_forge_metrics(rew_dict, policy_success_pred, true_successes)
         return rew_buf
 
     def _reset_idx(self, env_ids):
@@ -329,6 +288,9 @@ class ForgeEnv(FactoryEnv):
         rand_flips = torch.rand(self.num_envs) > 0.5
         self.flip_quats[rand_flips] = -1.0
 
+        if self.cfg_task.name == "peg_insert":
+            self._log_initial_geometry()
+
     def _reset_buffers(self, env_ids):
         """Reset additional logging metrics."""
         super()._reset_buffers(env_ids)
@@ -336,10 +298,21 @@ class ForgeEnv(FactoryEnv):
         for thresh in [0.5, 0.6, 0.7, 0.8, 0.9]:
             self.first_pred_success_tx[thresh][env_ids] = 0
 
-    def _log_forge_metrics(self, rew_dict, policy_success_pred):
+    def _log_forge_metrics(self, rew_dict, policy_success_pred, true_successes):
         """Log metrics to evaluate success prediction performance."""
+        log = self.extras.setdefault("log", {})
         for rew_name, rew in rew_dict.items():
             self.extras[f"logs_rew_{rew_name}"] = rew.mean()
+
+        quat_norm_error = torch.abs(torch.linalg.vector_norm(self.noisy_fingertip_quat, dim=-1) - 1.0).mean()
+        roll, pitch, _ = torch_utils.get_euler_xyz(self.fingertip_midpoint_quat)
+        roll_error = torch.abs(forge_utils.wrap_to_pi(roll - torch.pi)).mean()
+        pitch_error = torch.abs(forge_utils.wrap_to_pi(pitch)).mean()
+        current_success_rate = true_successes.float().mean()
+        log["Metrics/current_success_rate"] = current_success_rate
+        log["Orientation/quaternion_norm_error"] = quat_norm_error
+        log["Orientation/downward_roll_error_rad"] = roll_error
+        log["Orientation/downward_pitch_error_rad"] = pitch_error
 
         for thresh, first_success_tx in self.first_pred_success_tx.items():
             curr_predicted_success = policy_success_pred > thresh
@@ -351,8 +324,8 @@ class ForgeEnv(FactoryEnv):
             if torch.any(self.reset_buf):
                 # Log prediction delay.
                 delay_ids = torch.logical_and(self.ep_success_times != 0, first_success_tx != 0)
-                delay_times = (first_success_tx[delay_ids] - self.ep_success_times[delay_ids]).sum() / delay_ids.sum()
                 if delay_ids.sum().item() > 0:
+                    delay_times = (first_success_tx[delay_ids] - self.ep_success_times[delay_ids]).float().mean()
                     self.extras[f"early_term_delay_all/{thresh}"] = delay_times
 
                 correct_delay_ids = torch.logical_and(delay_ids, first_success_tx > self.ep_success_times)
@@ -381,3 +354,39 @@ class ForgeEnv(FactoryEnv):
                 et_recall = true_success_preds.sum() / num_true_success
                 if num_true_success > 0:
                     self.extras[f"early_term_recall/{thresh}"] = et_recall
+
+    def _log_initial_geometry(self):
+        """Record reset geometry without changing the Isaac 5.1 fingerpad model."""
+        held_base_pos, _ = factory_utils.get_held_base_pose(
+            self.held_pos,
+            self.held_quat,
+            self.cfg_task.name,
+            self.cfg_task.fixed_asset_cfg,
+            self.num_envs,
+            self.device,
+        )
+        target_base_pos, _ = factory_utils.get_target_held_base_pose(
+            self.fixed_pos,
+            self.fixed_quat,
+            self.cfg_task.name,
+            self.cfg_task.fixed_asset_cfg,
+            self.num_envs,
+            self.device,
+        )
+        left = self._robot.data.body_pos_w[:, self.left_finger_body_idx] - self.scene.env_origins
+        right = self._robot.data.body_pos_w[:, self.right_finger_body_idx] - self.scene.env_origins
+        finger_axis = right - left
+        axis_len_sq = torch.sum(finger_axis * finger_axis, dim=-1).clamp_min(1.0e-12)
+        segment_t = torch.sum((self.held_pos - left) * finger_axis, dim=-1) / axis_len_sq
+        closest = left + segment_t.clamp(0.0, 1.0).unsqueeze(-1) * finger_axis
+        distance_to_finger_segment = torch.linalg.vector_norm(self.held_pos - closest, dim=-1)
+        base_to_hole = held_base_pos[:, 2] - target_base_pos[:, 2]
+
+        log = self.extras.setdefault("log", {})
+        log["Geometry/peg_to_fingertip_height_m"] = (
+            self.held_pos[:, 2] - self.fingertip_midpoint_pos[:, 2]
+        ).mean()
+        log["Geometry/peg_to_finger_segment_m"] = distance_to_finger_segment.mean()
+        log["Geometry/peg_between_fingers_fraction"] = ((segment_t >= 0.0) & (segment_t <= 1.0)).float().mean()
+        log["Geometry/peg_bottom_to_hole_m"] = base_to_hole.mean()
+        log["Geometry/initial_penetration_fraction"] = (base_to_hole < -1.0e-3).float().mean()
