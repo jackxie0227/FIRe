@@ -37,3 +37,19 @@ test. If it OOMs, reduce optimizer/model memory while keeping the LLM and vision
 repeat the smoke and only generate a formal command after at least 1 GiB stable headroom is measured.
 
 Formal training remains a manual user action. Never store SSH passwords in this repository.
+
+## Transfer record (2026-09-06)
+
+The migration to `/home/ubuntu/RIM/projects/FIRe` completed over Tailscale SSH:
+
+- FIRe commit `864762a9416b4d1672f196c9d63e4b6a4929301c` was pushed directly into the
+  destination repository on branch `gr00t-peginsert-remote-training`.
+- The dataset arrived as 177 MiB and 4,021 files; an `rsync --checksum --dry-run` reported no
+  differences.
+- The patched `_gr00t` tree arrived at commit `755876a9afdb41ca6eb6383b36f4a0adb085c73f`;
+  its seven expected compatibility/adapter modifications are present.
+- The 4.1 GiB GR00T-N1-2B cache transferred successfully; an `rsync --checksum --dry-run`
+  reported no differences and the fixed snapshot links resolve on the destination.
+
+The destination has 318 GiB free disk space. PyPI and the PyTorch wheel index are reachable, but
+Hugging Face is not, which is why the model cache was transferred instead of downloaded remotely.
