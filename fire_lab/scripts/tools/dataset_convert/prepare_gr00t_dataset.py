@@ -8,10 +8,12 @@ import math
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from get_stats import compute_statistics, write_statistics
@@ -23,6 +25,40 @@ EXPERIMENT_ROOT = Path(
 ).expanduser()
 DEFAULT_SOURCE = EXPERIMENT_ROOT / "sim_demos" / "forge" / "peg_insert"
 DEFAULT_TARGET = EXPERIMENT_ROOT / "datasets" / "gr00t" / "forge" / "peg_insert"
+
+
+@dataclass(frozen=True)
+class DatasetProfile:
+    """Task-specific properties needed to validate and describe a dataset."""
+
+    name: str
+    expected_frames: int
+    task_description: str
+
+
+TASK_PROFILES = {
+    "peg_insert": DatasetProfile(
+        name="peg_insert",
+        expected_frames=89,
+        task_description="Insert peg into the socket",
+    ),
+    "gear_mesh": DatasetProfile(
+        name="gear_mesh",
+        expected_frames=149,
+        task_description="mesh the gears together",
+    ),
+    "nut_thread": DatasetProfile(
+        name="nut_thread",
+        expected_frames=149,
+        task_description="thread the nut onto the bolt",
+    ),
+}
+DEFAULT_PROFILE = TASK_PROFILES["peg_insert"]
+
+# Backward-compatible aliases for callers that imported the original
+# PegInsert-only constants.
+EXPECTED_FRAMES = DEFAULT_PROFILE.expected_frames
+TASK_DESCRIPTION = DEFAULT_PROFILE.task_description
 
 CAMERA_KEYS = (
     "observation.images.left_view",
@@ -43,10 +79,22 @@ EXPECTED_COLUMNS = (
     "next.done",
     "episode.success",
 )
-EXPECTED_FRAMES = 89
+EXPECTED_ARROW_TYPES = {
+    "observation.state": pa.list_(pa.float64()),
+    "observation.force": pa.list_(pa.float64()),
+    "action": pa.list_(pa.float64()),
+    "timestamp": pa.float64(),
+    "annotation.human.action.task_description": pa.int64(),
+    "task_index": pa.int64(),
+    "annotation.human.validity": pa.bool_(),
+    "episode_index": pa.int64(),
+    "index": pa.int64(),
+    "next.reward": pa.float64(),
+    "next.done": pa.bool_(),
+    "episode.success": pa.bool_(),
+}
 FPS = 15
 CHUNK_SIZE = 1000
-TASK_DESCRIPTION = "Insert peg into the socket"
 
 
 def parse_episode_id(path: Path) -> int:
@@ -96,26 +144,47 @@ def validate_arrow_schema(parquet: dict[int, Path]) -> None:
             f"Unexpected columns in {parquet[first_id]}: {reference.names}; "
             f"expected {list(EXPECTED_COLUMNS)}."
         )
+    type_mismatches = {
+        name: (reference.field(name).type, expected_type)
+        for name, expected_type in EXPECTED_ARROW_TYPES.items()
+        if reference.field(name).type != expected_type
+    }
+    if type_mismatches:
+        raise ValueError(
+            f"Unexpected Arrow types in {parquet[first_id]}: {type_mismatches}."
+        )
     for episode_id, path in parquet.items():
         if not pq.read_schema(path).remove_metadata().equals(reference):
             raise ValueError(f"Arrow schema mismatch in episode {episode_id}: {path}.")
 
 
-def validate_parquet_file(episode_id: int, path: Path) -> None:
+def validate_parquet_file(
+    episode_id: int, path: Path, profile: DatasetProfile = DEFAULT_PROFILE
+) -> None:
+    expected_frames = profile.expected_frames
     frame = pd.read_parquet(path)
-    if len(frame) != EXPECTED_FRAMES:
-        raise ValueError(f"Episode {episode_id} has {len(frame)} rows; expected {EXPECTED_FRAMES}.")
+    if len(frame) != expected_frames:
+        raise ValueError(f"Episode {episode_id} has {len(frame)} rows; expected {expected_frames}.")
     if tuple(frame.columns) != EXPECTED_COLUMNS:
         raise ValueError(f"Episode {episode_id} has unexpected columns.")
     state = np.stack(frame["observation.state"].to_numpy())
     force = np.stack(frame["observation.force"].to_numpy())
     action = np.stack(frame["action"].to_numpy())
-    if state.shape != (EXPECTED_FRAMES, 9):
-        raise ValueError(f"Episode {episode_id} state shape is {state.shape}, expected (89, 9).")
-    if force.shape != (EXPECTED_FRAMES, 3):
-        raise ValueError(f"Episode {episode_id} force shape is {force.shape}, expected (89, 3).")
-    if action.shape != (EXPECTED_FRAMES, 7):
-        raise ValueError(f"Episode {episode_id} action shape is {action.shape}, expected (89, 7).")
+    if state.shape != (expected_frames, 9):
+        raise ValueError(
+            f"Episode {episode_id} state shape is {state.shape}, "
+            f"expected ({expected_frames}, 9)."
+        )
+    if force.shape != (expected_frames, 3):
+        raise ValueError(
+            f"Episode {episode_id} force shape is {force.shape}, "
+            f"expected ({expected_frames}, 3)."
+        )
+    if action.shape != (expected_frames, 7):
+        raise ValueError(
+            f"Episode {episode_id} action shape is {action.shape}, "
+            f"expected ({expected_frames}, 7)."
+        )
     if not all(np.isfinite(values).all() for values in (state, force, action)):
         raise ValueError(f"Episode {episode_id} contains non-finite state, force, or action values.")
     timestamp = frame["timestamp"].to_numpy(dtype=np.float64)
@@ -130,12 +199,20 @@ def validate_parquet_file(episode_id: int, path: Path) -> None:
         raise ValueError(f"Episode {episode_id} is not consistently marked successful.")
     if not frame["annotation.human.validity"].astype(bool).all():
         raise ValueError(f"Episode {episode_id} contains invalid frames.")
-    if not (frame["next.reward"].to_numpy(dtype=np.float64) > 0).any():
+    reward = frame["next.reward"].to_numpy(dtype=np.float64)
+    if not np.isfinite(reward).all():
+        raise ValueError(f"Episode {episode_id} contains a non-finite reward.")
+    if not (reward > 0).any():
         raise ValueError(f"Episode {episode_id} never reaches the success reward.")
+    for task_column in ("annotation.human.action.task_description", "task_index"):
+        if set(frame[task_column].astype(int)) != {0}:
+            raise ValueError(
+                f"Episode {episode_id} has a non-zero value in {task_column}."
+            )
     if set(frame["episode_index"].astype(int)) != {episode_id}:
         raise ValueError(f"Episode {episode_id} has an incorrect episode_index column.")
     expected_indices = np.arange(
-        episode_id * EXPECTED_FRAMES, (episode_id + 1) * EXPECTED_FRAMES, dtype=np.int64
+        episode_id * expected_frames, (episode_id + 1) * expected_frames, dtype=np.int64
     )
     if not np.array_equal(frame["index"].to_numpy(dtype=np.int64), expected_indices):
         raise ValueError(f"Episode {episode_id} has non-contiguous global frame indices.")
@@ -154,12 +231,12 @@ def probe_video(path: Path) -> dict:
     return streams[0]
 
 
-def validate_video(path: Path) -> None:
+def validate_video(path: Path, profile: DatasetProfile = DEFAULT_PROFILE) -> None:
     stream = probe_video(path)
     expected = {
         "codec_name": "h264", "width": 256, "height": 256,
         "pix_fmt": "yuv420p", "r_frame_rate": "15/1",
-        "nb_read_frames": str(EXPECTED_FRAMES),
+        "nb_read_frames": str(profile.expected_frames),
     }
     mismatches = {
         key: (stream.get(key), value)
@@ -171,11 +248,14 @@ def validate_video(path: Path) -> None:
 
 
 def validate_source(
-    parquet: dict[int, Path], videos: dict[str, dict[int, Path]], video_check: str
+    parquet: dict[int, Path],
+    videos: dict[str, dict[int, Path]],
+    video_check: str,
+    profile: DatasetProfile = DEFAULT_PROFILE,
 ) -> None:
     validate_arrow_schema(parquet)
     for episode_id, path in parquet.items():
-        validate_parquet_file(episode_id, path)
+        validate_parquet_file(episode_id, path, profile)
     if video_check == "none":
         return
     if video_check == "sample":
@@ -185,7 +265,7 @@ def validate_source(
         episode_ids = sorted(parquet)
     for episode_id in episode_ids:
         for camera in CAMERA_KEYS:
-            validate_video(videos[camera][episode_id])
+            validate_video(videos[camera][episode_id], profile)
 
 
 def hardlink(source: Path, target: Path) -> None:
@@ -243,10 +323,13 @@ def feature_schema() -> dict:
     return features
 
 
-def build_metadata(episode_count: int) -> dict[str, str]:
+def build_metadata(
+    episode_count: int, profile: DatasetProfile = DEFAULT_PROFILE
+) -> dict[str, str]:
+    expected_frames = profile.expected_frames
     info = {
         "codebase_version": "v2.0", "robot_type": "franka_emika_panda",
-        "total_episodes": episode_count, "total_frames": episode_count * EXPECTED_FRAMES,
+        "total_episodes": episode_count, "total_frames": episode_count * expected_frames,
         "total_tasks": 1, "total_videos": len(CAMERA_KEYS),
         "total_chunks": math.ceil(episode_count / CHUNK_SIZE), "chunks_size": CHUNK_SIZE,
         "fps": float(FPS), "splits": {"train": "0:100"},
@@ -273,20 +356,44 @@ def build_metadata(episode_count: int) -> dict[str, str]:
         "annotation": {"human.action.task_description": {}, "human.validity": {}},
     }
     episodes = "".join(
-        json.dumps({"episode_index": episode_id, "tasks": [TASK_DESCRIPTION], "length": EXPECTED_FRAMES}) + "\n"
+        json.dumps(
+            {
+                "episode_index": episode_id,
+                "tasks": [profile.task_description],
+                "length": expected_frames,
+            }
+        )
+        + "\n"
         for episode_id in range(episode_count)
     )
     return {
         "info.json": json.dumps(info, indent=4) + "\n",
         "modality.json": json.dumps(modality, indent=4) + "\n",
         "episodes.jsonl": episodes,
-        "tasks.jsonl": json.dumps({"task_index": 0, "task": TASK_DESCRIPTION}) + "\n",
+        "tasks.jsonl": json.dumps(
+            {"task_index": 0, "task": profile.task_description}
+        )
+        + "\n",
     }
 
 
-def prepare(source: Path, target: Path, dry_run: bool, video_check: str) -> None:
+def prepare(
+    source: Path,
+    target: Path,
+    dry_run: bool,
+    video_check: str,
+    profile: DatasetProfile = DEFAULT_PROFILE,
+) -> None:
     source = source.expanduser().resolve()
     target = target.expanduser().resolve()
+    if source.name in TASK_PROFILES and source.name != profile.name:
+        raise ValueError(
+            f"Source directory {source.name!r} does not match task profile {profile.name!r}."
+        )
+    if target.name in TASK_PROFILES and target.name != profile.name:
+        raise ValueError(
+            f"Target directory {target.name!r} does not match task profile {profile.name!r}."
+        )
     parquet, videos = discover_source(source)
     if source == target:
         raise ValueError("Source and target must be separate directories.")
@@ -294,8 +401,12 @@ def prepare(source: Path, target: Path, dry_run: bool, video_check: str) -> None
         target.parent.mkdir(parents=True, exist_ok=True)
         if source.stat().st_dev != target.parent.stat().st_dev:
             raise OSError("Source and target are on different filesystems; hard links are not possible.")
+    print(
+        f"Task profile: {profile.name} "
+        f"({profile.expected_frames} frames, task={profile.task_description!r})"
+    )
     print(f"Validating {len(parquet)} Parquet files and {len(parquet) * len(CAMERA_KEYS)} videos...")
-    validate_source(parquet, videos, video_check)
+    validate_source(parquet, videos, video_check, profile)
     print(
         f"Plan: {len(parquet)} Parquet links, {len(parquet) * len(CAMERA_KEYS)} video links, "
         f"{math.ceil(len(parquet) / CHUNK_SIZE)} chunks, and 5 metadata files."
@@ -309,10 +420,11 @@ def prepare(source: Path, target: Path, dry_run: bool, video_check: str) -> None
         for camera in CAMERA_KEYS:
             video_source = videos[camera][episode_id]
             hardlink(video_source, target / "videos" / chunk / camera / video_source.name)
-    for filename, contents in build_metadata(len(parquet)).items():
+    for filename, contents in build_metadata(len(parquet), profile).items():
         write_text_atomic(target / "meta" / filename, contents)
     statistics, stats_episodes, stats_frames = compute_statistics(target)
-    if stats_episodes != len(parquet) or stats_frames != len(parquet) * EXPECTED_FRAMES:
+    expected_stats_frames = len(parquet) * profile.expected_frames
+    if stats_episodes != len(parquet) or stats_frames != expected_stats_frames:
         raise ValueError(f"Statistics input mismatch: episodes={stats_episodes}, frames={stats_frames}.")
     write_statistics(target / "meta" / "stats.json", statistics)
     print(f"Prepared dataset at {target}")
@@ -320,17 +432,40 @@ def prepare(source: Path, target: Path, dry_run: bool, video_check: str) -> None
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
-    parser.add_argument("--target", type=Path, default=DEFAULT_TARGET)
+    parser.add_argument(
+        "--task",
+        choices=tuple(TASK_PROFILES),
+        default=DEFAULT_PROFILE.name,
+        help="Task profile controlling paths, expected episode length, and task text.",
+    )
+    parser.add_argument(
+        "--source",
+        type=Path,
+        default=None,
+        help="Raw dataset root. Defaults to experiments/sim_demos/forge/<task>.",
+    )
+    parser.add_argument(
+        "--target",
+        type=Path,
+        default=None,
+        help="Prepared dataset root. Defaults to experiments/datasets/gr00t/forge/<task>.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--video-check", choices=("none", "sample", "all"), default="sample")
-    return parser.parse_args()
+    args = parser.parse_args()
+    profile = TASK_PROFILES[args.task]
+    if args.source is None:
+        args.source = EXPERIMENT_ROOT / "sim_demos" / "forge" / profile.name
+    if args.target is None:
+        args.target = EXPERIMENT_ROOT / "datasets" / "gr00t" / "forge" / profile.name
+    return args
 
 
 def main() -> int:
     args = parse_args()
+    profile = TASK_PROFILES[args.task]
     try:
-        prepare(args.source, args.target, args.dry_run, args.video_check)
+        prepare(args.source, args.target, args.dry_run, args.video_check, profile)
     except (FileNotFoundError, FileExistsError, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"[ERROR] {error}", file=sys.stderr)
         return 1

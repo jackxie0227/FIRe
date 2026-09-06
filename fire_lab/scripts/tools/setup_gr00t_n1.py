@@ -124,6 +124,36 @@ def main() -> None:
     ):
         changed.append(str(runner))
 
+    trainer = repo / "gr00t/experiment/trainer.py"
+    if replace_once(
+        trainer,
+        "import torch\nimport transformers\n",
+        "import numpy as np\nimport torch\nimport transformers\n",
+        args.check,
+    ):
+        changed.append(str(trainer))
+    if replace_once(
+        trainer,
+        "    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):\n",
+        "    def _load_rng_state(self, checkpoint):\n"
+        "        \"\"\"Allowlist NumPy RNG state types saved by this trusted local trainer.\n\n"
+        "        PyTorch 2.6 changed ``torch.load`` to default to ``weights_only=True``.\n"
+        "        Transformers 4.45 still loads its RNG checkpoint without an explicit\n"
+        "        value, so resuming otherwise fails before the next optimizer step.\n"
+        "        \"\"\"\n"
+        "        numpy_rng_types = [\n"
+        "            np.core.multiarray._reconstruct,\n"
+        "            np.ndarray,\n"
+        "            np.dtype,\n"
+        "            type(np.dtype(np.uint32)),\n"
+        "        ]\n"
+        "        with torch.serialization.safe_globals(numpy_rng_types):\n"
+        "            return super()._load_rng_state(checkpoint)\n\n"
+        "    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):\n",
+        args.check,
+    ):
+        changed.append(str(trainer))
+
     mode = "verified" if args.check else "synchronized"
     print(f"GR00T n1-release adapters {mode}; changed={len(set(changed))}")
     for path in sorted(set(changed)):

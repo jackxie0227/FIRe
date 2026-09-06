@@ -9,7 +9,7 @@
 - Conda 环境：`FIRe`
 - Python：`3.11.15`
 - GPU：NVIDIA GeForce RTX 5060 Ti 16 GB
-- NVIDIA Driver：`595.84`
+- NVIDIA Driver：`580.173.02`
 - Isaac Sim：`5.1.0.0`
 - PyTorch：`2.7.0+cu128`
 - torchvision：`0.22.0+cu128`
@@ -73,7 +73,10 @@ Forge PegInsert 基线 RL
   -> 仿真评估与对比
 ```
 
-PegInsert 跑通后，再将同一流程扩展到 GearMesh 和 NutThread。优先使用 `Forge` 任务，因为它对应 FIRe 的力觉信息复现主线；`Factory` 可作为无力觉或基础对照路线。
+PegInsert 仍作为完整闭环的主线；GearMesh 和 NutThread 已提前完成教师训练与原始
+示范采集，后续正式数据集、GR00T/FIRe 训练和评估按任务独立目录推进。优先使用
+`Forge` 任务，因为它对应 FIRe 的力觉信息复现主线；`Factory` 可作为无力觉或
+基础对照路线。
 
 ## 2. 阶段一：确定实验目录与配置数据路径
 
@@ -196,7 +199,7 @@ Stage3 策略已经通过阶段二验收。该策略可确定性加载并在原�
 
 ## 4. 阶段三：采集 GR00T 仿真示范数据
 
-**状态：小批量验收已完成（2026-08-31），待用户启动正式长时间采集**
+**状态：PegInsert 正式采集及全量验收已完成（2026-09-01）**
 
 阶段二归档已完成。正式入口 checkpoint 的 SHA-256 为：
 
@@ -288,34 +291,40 @@ python scripts/reinforcement_learning/rl_games/play.py \
 
 ## 5. 阶段四：整理 GR00T 数据集元数据与统计量
 
-**状态：数据集整理与本地验收已完成（2026-09-01）**
+**状态：PegInsert、GearMesh、NutThread 正式数据集均已完成并通过 GR00T loader 验收（2026-09-06）**
 
-1004 条成功 PegInsert 示范已经从原始采集归档以硬链接方式整理到正式数据集：
+三个任务均已从只读原始采集目录以硬链接方式整理到
+`experiments/datasets/gr00t/forge/<task>`：
 
-```text
-/home/rim/experiment/FIRe/fire_lab/experiments/datasets/gr00t/forge/peg_insert
-```
+| 任务 | Episodes | 每条帧数 | 总帧数 | Chunks | Parquet | 三路视频 | 硬链接总数 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| PegInsert | 1004 | 89 | 89,356 | 2 | 1004 | 3012 | 4016 |
+| GearMesh | 1000 | 149 | 149,000 | 1 | 1000 | 3000 | 4000 |
+| NutThread | 1002 | 149 | 149,298 | 2 | 1002 | 3006 | 4008 |
 
-正式数据集按每 1000 个 episode 分为 `chunk-000`（0–999）和
-`chunk-001`（1000–1003），包含 1004 份 Parquet 和三路共 3012 段视频。
-全部 4016 个数据/视频文件均验证为原始采集文件的硬链接，不额外复制媒体内容。
+每个目标数据/视频文件都已用 inode 一致性检查确认为对应原始文件的硬链接，源目录
+内容与文件数量未改变。每 1000 个 episode 分块；因此 GearMesh 只有 `chunk-000`，
+PegInsert 和 NutThread 还分别有包含 4 条、2 条 episode 的 `chunk-001`。
 
 生成的权威元数据位于正式数据集自身的 `meta/`，而 `fire_lab/gr00t/meta/`
-只保留为原作者模板，不再作为运行时元数据。真实汇总为 1004 episodes、89356
-frames、1 task、3 video streams、2 chunks 和 15 FPS。`observation.force`
-保留在 feature schema 和统计量中，但不加入 GR00T state modality，供后续 FIRe
-力觉残差策略使用。
+只保留为原作者模板，不再作为运行时元数据。三个目录的真实汇总见上表，均为
+1 task、3 video streams 和 15 FPS。`observation.force` 保留在 feature schema
+和统计量中，但不加入 GR00T state modality，供后续 FIRe 力觉残差策略使用。
 
 已完成以下验收：
 
-- 全部 Parquet 的 schema、89 帧边界、shape、有限数值、时间戳、成功标记、
+- 全部 Parquet 的 schema、任务对应的 89/149 帧边界、shape、有限数值、时间戳、成功标记、
   episode index 和全局 frame index 检查。
-- 全部 3012 段视频实际解码计帧，均为 H.264、256x256、yuv420p、15 FPS、89 帧。
-- `stats.json` 基于全部 89356 帧重新计算，包含 state、force、action 及其他数值字段。
-- 准备脚本支持 dry-run、多 chunk、重复运行硬链接一致性检查和全量/抽样视频验证。
+- 三任务的全部视频均完成实际解码计帧，均为 H.264、256x256、yuv420p、15 FPS，
+  且帧数与各任务 episode 长度一致。
+- 每个 `stats.json` 都基于对应正式数据集的全部帧重新计算，包含 state、force、action
+  及其他 6 个数值字段，所有统计量有限。
+- `prepare_gr00t_dataset.py` 已泛化为显式 task profile，支持 dry-run、多 chunk、重复
+  运行硬链接一致性检查和全量/抽样视频验证；PegInsert 的既有元数据输出保持不变。
 
-阶段五独立 Python 3.10 环境已完成 GR00T loader 验收：正式数据集被识别为
-1004 episodes、89356 frames，跨 chunk 抽样和单 batch 变换均通过。
+阶段五独立 Python 3.10 环境已完成三个正式数据集的 GR00T loader 验收：分别识别为
+89,356、149,000、149,298 samples；跨 chunk 抽样和单 batch 变换均通过。loader
+输出 state `(1,1,64)`、action `(1,16,32)`，三路图像均进入处理器且所有浮点输入有限。
 
 以仓库中的模板为基础准备数据集元数据：
 
@@ -327,12 +336,12 @@ fire_lab/gr00t/meta/stats.json
 fire_lab/gr00t/meta/modality.json
 ```
 
-需要完成：
+已落实：
 
 1. 根据实际采集结果生成或更新 episode 列表。
-2. 确认 task 描述与 PegInsert 数据一致。
+2. 确认 task 描述与各任务采集配置一致。
 3. 检查各 observation/action 字段、shape、dtype 和采样频率。
-4. 修改 `fire_lab/scripts/tools/dataset_convert/get_stats.py` 中的数据路径。
+4. `get_stats.py` 支持命令行数据集路径、多 chunk 扫描和计算前 schema 校验。
 5. 重新计算数据统计量并写入 `stats.json`。
 6. 确保数据目录结构满足 Isaac-GR00T/LeRobot 数据加载要求。
 
@@ -415,7 +424,7 @@ conda activate gr00t
 
 ## 7. 阶段六：微调并验证 GR00T 策略
 
-**状态：1-step 训练冒烟已完成，正式微调待启动（2026-09-01）**
+**状态：PegInsert 微调前置门禁全部通过，正式微调待用户启动（2026-09-06）**
 
 使用 batch size 1，冻结 LLM 与视觉骨干，训练 action projector 和 diffusion head，
 已完成 1 个 optimizer step：train loss `1.4126137495`，runtime `5.63 s`。初次运行
@@ -428,9 +437,35 @@ OOM；修复后训练前 GPU memory 从约 8.16 GiB 降至 4.08 GiB并正常完�
 /home/rim/experiment/FIRe/fire_lab/experiments/gr00t_finetune/forge/peg_insert/smoke
 ```
 
-目录约 12 GB，包含 `checkpoint-1` 的模型、optimizer、scheduler、RNG 和 trainer
-state，以及根目录最终模型。已从根目录 checkpoint 重新加载并完成单 batch 前向，
-loss `1.234375` 且有限，证明保存的 checkpoint 可加载。
+最初的 1-step 目录约 12 GB，包含 `checkpoint-1` 的模型、optimizer、scheduler、RNG
+和 trainer state，以及根目录最终模型。已从根目录 checkpoint 重新加载并完成单 batch
+前向，loss `1.234375` 且有限，证明保存的 checkpoint 可加载。完成下述恢复测试后，
+目录已精简为约 4.1 GB。
+
+2026-09-06 已补齐正式训练前门禁：
+
+- GR00T adapter/兼容补丁与固定 commit 一致；数据 loader 跨 chunk 边界复验通过。
+- batch size `1、2、4` 均完成真实 AdamW 更新，249 个梯度张量全部有限；峰值 allocated
+  显存约为 `10.51 GiB`，因此正式训练选择 batch size 4。
+- 修复 PyTorch 2.6+ 与 Transformers 4.45.2 的 RNG checkpoint 恢复兼容问题后，
+  `checkpoint-1` 已成功恢复至 step 2，optimizer、scheduler 和 RNG 均可加载。
+- step-2 模型完成 10 次离线策略推理，合并动作 shape 为 `(16, 7)`，预热后平均延迟
+  `71.26 ms`，allocated 显存稳定在 `4.102 GiB`。
+- 根模型与 step-2 checkpoint 权重 SHA-256 均为
+  `c933f2e4321745bb43e456f9393977ce388c12d16014152496e68cda15aa87e6`。验证后已按最小
+  证据策略删除可再生成的中间 checkpoint，仅保留可加载根模型、配置、trainer state
+  和测试报告。
+
+完整预检记录和由用户手动执行的正式训练命令位于：
+
+```text
+experiments/gr00t_finetune/forge/peg_insert/preflight/preflight_report.json
+experiments/gr00t_finetune/forge/peg_insert/preflight/README.md
+experiments/gr00t_finetune/forge/peg_insert/preflight/formal_training_command.txt
+```
+
+正式训练命令尚未执行。固定配置为 20,000 steps、batch size 4、seed 42、每 500 step
+保存一次、本地 TensorBoard、冻结 LLM/视觉骨干并训练 projector/diffusion head。
 
 使用 Isaac-GR00T 中的训练脚本进行微调，核心入口为：
 
@@ -569,17 +604,72 @@ python scripts/reinforcement_learning/rl_games/train.py \
 
 ## 12. 阶段十一：扩展到 GearMesh 和 NutThread
 
-PegInsert 完成闭环后，对 GearMesh、NutThread 分别重复：
+**状态：GearMesh/NutThread 教师训练、原始示范采集和正式 GR00T 数据集均已完成（2026-09-06）**
 
-1. 训练对应 Forge baseline。
-2. 采集对应 GR00T 示范数据。
-3. 生成任务各自的 meta 与 statistics。
-4. 微调任务对应的 GR00T 模型。
-5. 启动推理服务并完成 residual 冒烟测试。
-6. 正式训练 FIRe residual。
-7. 执行多 seed 仿真评估。
+三个 Forge 任务的原始示范已经完成只读审计。权威原始采集目录及结果如下：
 
-每个任务的数据集、模型、日志和评估结果应使用独立目录，避免相互覆盖。
+| 任务 | 原始目录 | Episodes | 每条帧数 | 总帧数 | Parquet | 三路视频 |
+|---|---|---:|---:|---:|---:|---:|
+| PegInsert | `experiments/sim_demos/forge/peg_insert` | 1004 | 89 | 89,356 | 1004 | 3012 |
+| GearMesh | `experiments/sim_demos/forge/gear_mesh` | 1000 | 149 | 149,000 | 1000 | 3000 |
+| NutThread | `experiments/sim_demos/forge/nut_thread` | 1002 | 149 | 149,298 | 1002 | 3006 |
+
+三套原始数据的 episode 编号连续，Parquet 与三路视频一一对应。全部 Parquet
+均为相同的 12 列 Arrow schema，包含 9 维 `observation.state`、3 维
+`observation.force` 和 7 维 `action`；所有数值有限，时间戳匹配 15 Hz，末帧
+唯一 `next.done=true`，success/validity、episode index 和全局 frame index
+均正确。GearMesh/NutThread 的全部视频已完成逐文件 metadata/计帧检查，均为
+H.264、256x256、yuv420p、15 FPS 和 149 帧，并对跨数据集位置的多组视频完成
+完整解码。PegInsert 的同类全量验收和正式数据集 loader 验收已在阶段四、阶段五
+记录。
+
+NutThread 中有少数 episode 在中途达到成功、末帧离开成功状态；当前采集器的
+正式规则是 episode 内 `any(next.reward)` 即可保存，因此仍属于合规的成功示范。
+后续若改用“末帧必须成功”的数据定义，需要显式过滤并重新生成元数据，不能静默
+改变现有基线。
+
+对应教师模型已经训练完成，原始采集使用的 source checkpoint 及 SHA-256 为：
+
+```text
+GearMesh: /home/rim/experiment/FIRe/fire_lab/logs/rl_games/Forge/gear_mesh_teacher_20260905_seed0_env128/nn/Forge.pth
+          aa7626a211ba2079409e8d3d71262439a2978ccfa5733afaa2297fc2425ab82e
+NutThread: /home/rim/experiment/FIRe/fire_lab/logs/rl_games/Forge/nut_thread_teacher_20260904_seed0_env128/nn/Forge.pth
+           186f3348143d3e6e7f39a4c9ebf4af54dce24ac74810b70de69a7d57cb12a21c
+```
+
+这两个 checkpoint 尚未像 PegInsert 一样生成正式 baseline 归档、元数据和独立
+deterministic 多 seed 评估；该工作仍是后续基线对比和可追溯性的门禁，但不要求
+重新采集当前原始示范。
+
+当前正式数据集状态：
+
+- PegInsert 已完整整理到 `experiments/datasets/gr00t/forge/peg_insert`，包括正确
+  分块、硬链接、五个 meta 文件、全量统计和 GR00T loader 验收。
+- `experiments/datasets/gr00t/forge/gear_mesh` 已生成，只有 `chunk-000`
+  （episode 0–999），汇总为 1000 episodes、149,000 frames、1 task、
+  3 video streams、1 chunk、15 FPS；task 0 为 `mesh the gears together`。
+- `experiments/datasets/gr00t/forge/nut_thread` 已生成，包含
+  `chunk-000`（0–999）与 `chunk-001`（1000–1001），汇总为 1002 episodes、
+  149,298 frames、1 task、3 video streams、2 chunks、15 FPS；task 0 为
+  `thread the nut onto the bolt`。
+
+正式数据集继续采用与 PegInsert 相同的硬链接归档方式。三任务都应保留
+`observation.force` 于 feature schema 和 `stats.json`，但不加入 GR00T state
+modality；权威元数据必须位于各自正式数据集的 `meta/`，仓库内 `gr00t/meta/`
+仅作为旧模板。
+
+`scripts/tools/dataset_convert/prepare_gr00t_dataset.py` 已改为显式 task profile；
+GearMesh/NutThread 均已完成 dry-run、全量视频验证、硬链接生成、五个 meta 文件、
+全量统计、重复运行一致性检查和 GR00T 单 batch loader 验收。NutThread loader 已在
+全局索引 148999/149000 处验证跨 chunk 连续读取。后续按以下顺序继续：
+
+1. 归档两个教师 checkpoint，并补充独立 deterministic 多 seed 基线评估。
+2. 对 GearMesh/NutThread 分别运行 1 optimizer step 的 GR00T 训练冒烟测试。
+3. 微调任务对应的 GR00T 模型。
+4. 启动推理服务并完成 residual 冒烟测试。
+5. 正式训练 FIRe residual，并执行多 seed 仿真评估。
+
+每个任务的数据集、模型、日志和评估结果必须使用独立目录，避免相互覆盖。
 
 ## 13. 可选阶段：真实机器人部署
 
@@ -608,22 +698,26 @@ fire_deploy/
 - [x] M2：统一数据、checkpoint 和评估输出路径。
 - [x] M3：获得有效的 Forge PegInsert baseline checkpoint。
 - [x] M4：完成一小批 PegInsert 示范数据采集与格式验证。
-- [x] M5：完成正式示范数据集及 GR00T meta/statistics。
+- [x] M5：完成 Forge PegInsert 正式示范数据集及 GR00T meta/statistics。
 - [x] M6：建立独立 `gr00t` Python 3.10 环境并通过单 batch 测试。
 - [ ] M7：完成 GR00T 微调与离线评估。
 - [ ] M8：打通 GR00T server 与 FIRe residual 训练冒烟测试。
 - [ ] M9：完成 Forge PegInsert FIRe 正式训练及多 seed 评估。
-- [ ] M10：复现 GearMesh 和 NutThread。
+- [ ] M10：复现 GearMesh 和 NutThread（教师模型、原始示范和正式数据集已完成；
+  GR00T/FIRe 训练及评估待完成）。
 - [ ] M11：整理与论文指标的对比、差异和复现实验记录。
 - [ ] M12（可选）：开展真实机器人部署。
 
 ## 15. 下一步
 
-当前应进入 M7（阶段六）：
+三个任务的数据整理前置工作已经完成。当前应继续各任务的 M7（阶段六）：
 
-1. 先用 batch size 1、冻结 LLM 和视觉骨干的配置运行 1 个 optimizer step 冒烟训练，
-   将输出写入 `fire_lab/experiments/gr00t_finetune/forge/peg_insert/smoke`。
-2. 根据实测显存决定正式训练 batch size 与 gradient accumulation；16 GB 单卡从
-   batch size 1 开始，不直接使用上游默认 batch size 16。
-3. 固定 learning rate、训练步数、seed、可训练模块和 checkpoint 保存频率后启动微调。
-4. 微调完成后先做离线动作 shape、有限值和反归一化检查，再启动推理服务。
+1. 先为 GearMesh/NutThread 归档教师 checkpoint 与配置，并补充独立 deterministic
+   多 seed 基线评估，保证后续对比可追溯。
+2. 保留已经通过的 PegInsert 1-step GR00T 冒烟结果；对 GearMesh/NutThread 分别
+   运行同等配置的 1 optimizer step 冒烟训练。
+3. PegInsert 已根据实测选择正式 batch size 4；GearMesh/NutThread 后续仍从 batch
+   size 1 逐级测试，不直接使用上游默认 batch size 16。
+4. 固定 learning rate、训练步数、seed、可训练模块和 checkpoint 保存频率后，按任务
+   分目录启动正式微调；完成后先做离线动作 shape、有限值和反归一化检查，再启动
+   推理服务。
