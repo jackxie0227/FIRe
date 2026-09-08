@@ -158,11 +158,16 @@ class ForgeGr00tEnv(ForgeEnv):
         rew_buf += r_penalty
         rew_buf += r_shaping
 
-        wandb.log({
-            "success rate": curr_successes.float().mean() * 100,
-            "r_penalty": r_penalty.float().mean(),
-            "r_shaping": r_shaping.float().mean(),
-        })
+        # Evaluation utilities such as ``zero_agent.py`` do not initialize a
+        # W&B run.  Logging unconditionally makes the environment fail on its
+        # first step, before a VLA-only rollout can be observed.  Keep direct
+        # W&B logging for tracked PPO runs, but make it optional for inference.
+        if wandb.run is not None:
+            wandb.log({
+                "success rate": curr_successes.float().mean() * 100,
+                "r_penalty": r_penalty.float().mean(),
+                "r_shaping": r_shaping.float().mean(),
+            })
         # print(f"======= {self.episode_length_buf[0]} / {self.max_episode_length} =======")
         # print(f"success rate: {curr_successes.float().mean()*100}%")
 

@@ -18,6 +18,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-backend", default="decord")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Accumulate this many micro-batches before each optimizer update.",
+    )
     parser.add_argument("--backward", action="store_true")
     parser.add_argument(
         "--optimizer-steps",
@@ -26,6 +32,11 @@ def parse_args() -> argparse.Namespace:
         help="Run this many AdamW updates; implies --backward.",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--optim",
+        choices=("adamw_torch", "adamw_bnb_8bit", "paged_adamw_8bit"),
+        default="adamw_torch",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--json-output", type=Path)
     parser.add_argument(
@@ -42,6 +53,8 @@ def main() -> None:
         raise ValueError("--batch-size must be positive")
     if args.optimizer_steps < 0:
         raise ValueError("--optimizer-steps cannot be negative")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be positive")
     run_backward = args.backward or args.optimizer_steps > 0
     os.environ.setdefault("HF_HOME", str(args.hf_home.resolve()))
     os.environ.setdefault("TRANSFORMERS_CACHE", str((args.hf_home / "transformers").resolve()))
@@ -93,13 +106,25 @@ def main() -> None:
     parameter_probes = {}
     if args.optimizer_steps:
         trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
-        optimizer = torch.optim.AdamW(
-            trainable,
-            lr=args.learning_rate,
-            betas=(0.95, 0.999),
-            eps=1e-8,
-            weight_decay=1e-5,
-        )
+        optimizer_kwargs = {
+            "lr": args.learning_rate,
+            "betas": (0.95, 0.999),
+            "eps": 1e-8,
+            "weight_decay": 1e-5,
+        }
+        if args.optim == "adamw_torch":
+            optimizer = torch.optim.AdamW(trainable, **optimizer_kwargs)
+        else:
+            try:
+                import bitsandbytes as bnb
+            except ImportError as error:
+                raise RuntimeError(f"{args.optim} requires bitsandbytes") from error
+            optimizer_cls = (
+                bnb.optim.AdamW8bit
+                if args.optim == "adamw_bnb_8bit"
+                else bnb.optim.PagedAdamW8bit
+            )
+            optimizer = optimizer_cls(trainable, **optimizer_kwargs)
         parameter_probes = {
             name: parameter.detach().reshape(-1)[:16].float().cpu().clone()
             for name, parameter in model.named_parameters()
@@ -108,11 +133,12 @@ def main() -> None:
 
     losses = []
     gradient_tensors = 0
-    passes = max(1, args.optimizer_steps)
+    passes = max(1, args.optimizer_steps * args.gradient_accumulation_steps)
     context = torch.enable_grad() if run_backward else torch.inference_mode()
     with context:
         for step in range(passes):
-            if optimizer is not None:
+            accumulation_index = step % args.gradient_accumulation_steps
+            if optimizer is not None and accumulation_index == 0:
                 optimizer.zero_grad(set_to_none=True)
             outputs = model(batch)
             loss = outputs["loss"]
@@ -123,7 +149,7 @@ def main() -> None:
             if not loss_finite:
                 raise RuntimeError("Forward produced a NaN or Inf loss")
             if run_backward:
-                loss.backward()
+                (loss / args.gradient_accumulation_steps).backward()
                 gradients = [
                     parameter.grad
                     for parameter in model.parameters()
@@ -139,7 +165,7 @@ def main() -> None:
                 )
                 if not gradients_finite:
                     raise RuntimeError("Backward produced NaN or Inf gradients")
-            if optimizer is not None:
+            if optimizer is not None and accumulation_index + 1 == args.gradient_accumulation_steps:
                 optimizer.step()
 
     changed_parameter_tensors = 0
@@ -173,7 +199,10 @@ def main() -> None:
             "model": args.model,
             "device": args.device,
             "batch_size": args.batch_size,
+            "effective_batch_size": args.batch_size * args.gradient_accumulation_steps,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "optimizer_steps": args.optimizer_steps,
+            "optim": args.optim,
             "losses": losses,
             "gradient_tensors": gradient_tensors,
             "changed_parameter_tensors": changed_parameter_tensors,

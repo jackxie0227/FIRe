@@ -231,7 +231,7 @@ git clone https://github.com/NVIDIA/Isaac-GR00T.git
 cd Isaac-GR00T
 conda create -n gr00t python=3.10
 conda activate gr00t
-pip install --upgrade setuptools
+pip install setuptools==80.9.0  # TensorBoard 2.20 still imports pkg_resources
 pip install -e .[base]
 pip install --no-build-isolation flash-attn==2.7.1.post4 
 ```

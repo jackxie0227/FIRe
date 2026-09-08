@@ -233,6 +233,12 @@ class DirectRLVlaEnv(DirectRLEnv):
         left_view, right_view, wrist_view = self._get_vla_images()
         eef_pos, eef_quat, gripper_qpos = self._get_vla_robot_state(np.float64)
 
+        instruction = {
+            "peg_insert": "Insert peg into the socket",
+            "gear_mesh": "mesh the gears together",
+            "nut_thread": "thread the nut onto the bolt",
+        }.get(getattr(self.cfg, "task_name", ""), "complete the manipulation task")
+
         return {
             "video.left_view": np.expand_dims(left_view, axis=1),
             "video.right_view": np.expand_dims(right_view, axis=1),
@@ -240,6 +246,7 @@ class DirectRLVlaEnv(DirectRLEnv):
             "state.eef_position": np.expand_dims(eef_pos, axis=1),
             "state.eef_quaternion": np.expand_dims(eef_quat, axis=1),
             "state.gripper_qpos": np.expand_dims(gripper_qpos, axis=1),
+            "annotation.human.action.task_description": [instruction] * self.num_envs,
         }
 
     def _get_pi05_observations(self) -> Dict[str, Any]:

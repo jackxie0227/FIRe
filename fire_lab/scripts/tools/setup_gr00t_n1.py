@@ -114,6 +114,71 @@ def main() -> None:
         args.check,
     ):
         changed.append(str(finetune_script))
+    if replace_once(
+        finetune_script,
+        "    batch_size: int = 16\n"
+        '    """Batch size per GPU for training."""\n',
+        "    batch_size: int = 16\n"
+        '    """Batch size per GPU for training."""\n\n'
+        "    gradient_accumulation_steps: int = 1\n"
+        '    """Number of micro-batches accumulated before each optimizer update."""\n',
+        args.check,
+    ):
+        changed.append(str(finetune_script))
+    if replace_once(
+        finetune_script,
+        "    warmup_ratio: float = 0.05\n"
+        '    """Ratio of total training steps used for warmup."""\n',
+        "    warmup_ratio: float = 0.05\n"
+        '    """Ratio of total training steps used for warmup."""\n\n'
+        '    optim: str = "adamw_torch"\n'
+        '    """Transformers optimizer name (for example, adamw_torch or adamw_bnb_8bit)."""\n',
+        args.check,
+    ):
+        changed.append(str(finetune_script))
+    if replace_once(
+        finetune_script,
+        "    resume: bool = False\n"
+        '    """Whether to resume from a checkpoint."""\n',
+        "    resume: bool = False\n"
+        '    """Whether to resume from a checkpoint."""\n\n'
+        "    resume_from_checkpoint: str | None = None\n"
+        '    """Exact checkpoint directory to resume from; takes precedence over automatic discovery."""\n',
+        args.check,
+    ):
+        changed.append(str(finetune_script))
+    if replace_once(
+        finetune_script,
+        '    """Main training function."""\n'
+        "    # ------------ step 1: load dataset ------------\n",
+        '    """Main training function."""\n'
+        "    if config.resume and config.resume_from_checkpoint is not None:\n"
+        '        raise ValueError("Use either --resume or --resume-from-checkpoint, not both")\n\n'
+        "    # ------------ step 1: load dataset ------------\n",
+        args.check,
+    ):
+        changed.append(str(finetune_script))
+    if replace_once(
+        finetune_script,
+        "        resume_from_checkpoint=config.resume,\n",
+        "        resume_from_checkpoint=config.resume_from_checkpoint or config.resume,\n",
+        args.check,
+    ):
+        changed.append(str(finetune_script))
+    if replace_once(
+        finetune_script,
+        "        gradient_accumulation_steps=1,\n",
+        "        gradient_accumulation_steps=config.gradient_accumulation_steps,\n",
+        args.check,
+    ):
+        changed.append(str(finetune_script))
+    if replace_once(
+        finetune_script,
+        '        optim="adamw_torch",\n',
+        "        optim=config.optim,\n",
+        args.check,
+    ):
+        changed.append(str(finetune_script))
 
     runner = repo / "gr00t/experiment/runner.py"
     if replace_once(
