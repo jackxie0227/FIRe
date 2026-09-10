@@ -122,6 +122,10 @@ class ForgeGr00tEnv(ForgeEnv):
             success_threshold=self.cfg_task.success_threshold,
             check_rot=check_rot,
         )
+        first_successes = torch.logical_and(curr_successes, torch.logical_not(self.ep_succeeded))
+        self.ep_succeeded[curr_successes] = 1
+        first_success_ids = first_successes.nonzero(as_tuple=False).squeeze(-1)
+        self.ep_success_times[first_success_ids] = self.episode_length_buf[first_success_ids]
         r_s = curr_successes.float()
         # ============================================================
         # (2) Contact force penalty: r_penalty

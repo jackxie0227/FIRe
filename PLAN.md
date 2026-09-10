@@ -424,7 +424,7 @@ conda activate gr00t
 
 ## 7. 阶段六：微调并验证 GR00T 策略
 
-**状态：PegInsert 微调前置门禁全部通过，正式微调待用户启动（2026-09-06）**
+**状态：PegInsert 正式微调、离线检查和 VLA-only 仿真评估均已完成（2026-09-09）**
 
 使用 batch size 1，冻结 LLM 与视觉骨干，训练 action projector 和 diffusion head，
 已完成 1 个 optimizer step：train loss `1.4126137495`，runtime `5.63 s`。初次运行
@@ -464,8 +464,18 @@ experiments/gr00t_finetune/forge/peg_insert/preflight/README.md
 experiments/gr00t_finetune/forge/peg_insert/preflight/formal_training_command.txt
 ```
 
-正式训练命令尚未执行。固定配置为 20,000 steps、batch size 4、seed 42、每 500 step
-保存一次、本地 TensorBoard、冻结 LLM/视觉骨干并训练 projector/diffusion head。
+正式训练已经执行完成。固定配置为 20,000 steps、batch size 4、seed 42、每 500 step
+保存一次、本地 TensorBoard、冻结 LLM/视觉骨干并训练 action projector 与 diffusion
+head。最终 `global_step=20000`、`train_loss=0.2274815`、训练耗时
+`5559.56 s`（约 92.7 分钟），输出位于：
+
+```text
+experiments/gr00t_finetune/forge/peg_insert/n1_2b_steps20000_seed42_bs4_20260907
+```
+
+根目录模型及 `checkpoint-20000` 均可加载；推理使用 16-step action chunk 和 4 个
+denoising steps。训练状态、优化器、scheduler 和 RNG checkpoint 均已保存，微调过程
+具备断点恢复证据。
 
 使用 Isaac-GR00T 中的训练脚本进行微调，核心入口为：
 
@@ -501,7 +511,12 @@ scripts/eval_policy.py
 - 离线评估脚本正常运行。
 - 模型输出能够通过 FIRe 客户端的协议和 shape 检查。
 
+上述验收均已通过。微调模型已通过 GR00T server、FIRe 客户端、三相机输入、语言指令、
+动作反归一化和有限值检查。
+
 ## 8. 阶段七：启动 GR00T 推理服务
+
+**状态：PegInsert 推理服务与 VLA-only 评估已完成（2026-09-09）**
 
 在 `gr00t` Python 3.10 环境中启动策略推理服务，默认规划使用：
 
@@ -523,7 +538,31 @@ port: 5555
 - 推理服务可稳定响应连续请求。
 - FIRe 仿真客户端可以取得有效 VLA 动作。
 
+服务已使用微调模型在 `localhost:5555` 完成验证。返回动作 shape 为 `(1, 16, 7)`，
+FIRe 环境能够按 chunk 执行动作；推理 observation 已包含与训练数据一致的任务语言
+`Insert peg into the socket`。无 W&B run 的纯推理路径不会再因 `wandb.log()` 中断。
+
+已完成 PPO 教师与 GR00T-only 各 500 episodes 的同 seed 评估：
+
+- PPO 教师：`397/500 = 79.4%`，Wilson 95% CI `[75.6%, 82.7%]`。
+- GR00T-only：`67/500 = 13.4%`，Wilson 95% CI `[10.7%, 16.7%]`。
+- 全量描述性差值为 `-66.0` 个百分点。
+- 严格物理初态容差 `1e-5` 下保留 392 对：PPO `80.87%`，GR00T `13.27%`，
+  McNemar exact `p=1.75e-75`。
+- 另有 108 对虽然 condition seed 和显式随机化量相同，但重置落稳后的机械臂或夹持件
+  状态受前一 episode 影响而漂移；不得把全量 500 对表述为严格状态回放实验。
+
+原始结果与审计输出位于：
+
+```text
+experiments/evaluations/paired/peg_insert/ppo_500.json
+experiments/evaluations/paired/peg_insert/gr00t_500.json
+experiments/evaluations/paired/peg_insert/comparison_500.json
+```
+
 ## 9. 阶段八：FIRe 力觉残差策略冒烟测试
+
+**状态：下一步执行；不得跳过直接启动正式训练（2026-09-10）**
 
 保持 GR00T 服务运行，在 `FIRe` 环境中执行：
 
@@ -537,6 +576,9 @@ python scripts/reinforcement_learning/rl_games/train.py \
   --enable_cameras \
   --num_envs=4 \
   --max_iterations=1 \
+  --seed=0 \
+  --run_name=gr00t_peginsert_residual_smoke_seed0 \
+  --save_frequency=1 \
   env.vla_host=localhost \
   env.vla_port=5555
 ```
@@ -559,6 +601,21 @@ python scripts/reinforcement_learning/rl_games/train.py \
 - 训练至少完成 1 iteration 并保存 checkpoint。
 - 无 shape mismatch、超时、NaN 或显存泄漏。
 
+执行分为两道门禁：
+
+1. **1 iteration 链路冒烟**：确认 GR00T server、三相机 observation、VLA action
+   chunk、force-aware residual observation、动作相加、奖励、PPO update 和 checkpoint
+   保存全部正常。
+2. **20 iterations 稳定性冒烟**：使用独立 run name 从头训练，检查 policy/value loss、
+   KL、entropy、episode reward、成功率、接触力、推理延迟和两端显存；不得出现 NaN、
+   持续显存增长或服务请求堆积。
+
+当前 PPO 配置为 `horizon_length=128`、`minibatch_size=512`，所以不修改配置时
+`num_envs=4` 是一个完整 minibatch 的最小并行数。如果本机 16 GB GPU 无法同时承载
+GR00T server 与 4-env 三相机 Isaac Sim，优先把 GR00T server 放到 Tailscale 远端 GPU；
+不要只把 `num_envs` 改为 2 而继续保留 512 的 minibatch。若必须使用 2 envs，应同时把
+actor 与 central-value minibatch 都改为 256，并重新冒烟。
+
 ## 10. 阶段九：正式训练 FIRe 残差策略
 
 冒烟测试通过后，移除 `--max_iterations=1`，执行正式训练。
@@ -569,6 +626,14 @@ python scripts/reinforcement_learning/rl_games/train.py \
 - 如果 Isaac Sim 与 GR00T 共用同一张 16 GB GPU，需要控制仿真环境数、图像分辨率、GR00T batch 和模型精度。
 - 如果显存不足，优先减少并行环境数和推理 batch；必要时将 GR00T 服务部署到另一张 GPU 或另一台机器，并修改 `env.vla_host`。
 - 至少运行多个随机种子，不以单次训练结果代表最终效果。
+- 正式预算按采样帧对齐，而不是机械照搬 iteration 数。仓库参考预算为
+  `64 envs × 128 horizon × 200 iterations = 1,638,400 frames`；因此 4 envs 对应
+  约 3200 iterations，2 envs 对应约 6400 iterations。
+- 第一条正式 run 先使用 seed 0。只有成功率曲线高于 GR00T-only 起点且训练稳定后，
+  再按同配置运行 seed 1、2；每条 run 使用唯一 `--run_name`，建议每 100 iterations
+  保存一次。
+- 中断恢复必须显式传入该 run 的 checkpoint，并核对恢复后的 epoch、optimizer、
+  scheduler 和归一化统计，禁止无意间从头覆盖同名目录。
 
 验收标准：
 
@@ -594,7 +659,11 @@ python scripts/reinforcement_learning/rl_games/train.py \
 - 失败类型分布
 - 不同随机种子的均值和标准差
 
-当前仓库没有完整的论文指标批量汇总脚本，因此需要补充一个固定种子、固定 episode 数的评估与聚合流程。所有方法必须使用相同的初始状态分布和评估预算。
+PPO 教师与 GR00T-only 的固定 seed 评估和聚合入口已经建立；GR00T + FIRe residual
+仍待训练后接入。配对脚本会保存逐 episode 初始状态并拒绝把超出容差的组合标记为
+严格配对，也支持显式剔除不匹配状态并保留完整审计列表。最终评估仍需为 residual
+checkpoint 补齐相同的 500-episode 入口，必要时增加初始状态录制/回放以消除跨 episode
+物理历史依赖。
 
 验收标准：
 
@@ -700,7 +769,7 @@ fire_deploy/
 - [x] M4：完成一小批 PegInsert 示范数据采集与格式验证。
 - [x] M5：完成 Forge PegInsert 正式示范数据集及 GR00T meta/statistics。
 - [x] M6：建立独立 `gr00t` Python 3.10 环境并通过单 batch 测试。
-- [ ] M7：完成 GR00T 微调与离线评估。
+- [x] M7：完成 PegInsert GR00T 微调、推理闭环与 VLA-only 仿真评估。
 - [ ] M8：打通 GR00T server 与 FIRe residual 训练冒烟测试。
 - [ ] M9：完成 Forge PegInsert FIRe 正式训练及多 seed 评估。
 - [ ] M10：复现 GearMesh 和 NutThread（教师模型、原始示范和正式数据集已完成；
@@ -710,14 +779,15 @@ fire_deploy/
 
 ## 15. 下一步
 
-三个任务的数据整理前置工作已经完成。当前应继续各任务的 M7（阶段六）：
+当前主线转入 PegInsert M8/M9：
 
-1. 先为 GearMesh/NutThread 归档教师 checkpoint 与配置，并补充独立 deterministic
-   多 seed 基线评估，保证后续对比可追溯。
-2. 保留已经通过的 PegInsert 1-step GR00T 冒烟结果；对 GearMesh/NutThread 分别
-   运行同等配置的 1 optimizer step 冒烟训练。
-3. PegInsert 已根据实测选择正式 batch size 4；GearMesh/NutThread 后续仍从 batch
-   size 1 逐级测试，不直接使用上游默认 batch size 16。
-4. 固定 learning rate、训练步数、seed、可训练模块和 checkpoint 保存频率后，按任务
-   分目录启动正式微调；完成后先做离线动作 shape、有限值和反归一化检查，再启动
-   推理服务。
+1. 启动已微调 GR00T server，执行 4-env、1-iteration residual PPO 链路冒烟；记录
+   Isaac Sim 与服务端峰值显存、单次 chunk 推理延迟和 checkpoint 路径。
+2. 链路通过后执行独立的 20-iteration 稳定性冒烟，确认 PPO 指标有限、奖励/成功率
+   可学习且无显存增长；失败时先定位链路、奖励或容量问题，不直接增加训练预算。
+3. 根据实测容量选择本地或远端 GR00T server，并锁定 `num_envs`、minibatch、seed、
+   run name、保存频率与总采样帧。4 envs 时正式单 seed 预算暂定 3200 iterations。
+4. 完成 seed 0 正式训练并用固定条件评估 GR00T + residual；确认优于 GR00T-only 后，
+   再运行 seed 1、2并聚合均值、标准差和置信区间。
+5. PegInsert M9 完成后再回到 GearMesh/NutThread 的 GR00T 微调与 residual 复现，避免
+   三个任务同时展开导致配置和结论不可追溯。
