@@ -564,6 +564,52 @@ experiments/evaluations/paired/peg_insert/comparison_500.json
 
 **状态：下一步执行；不得跳过直接启动正式训练（2026-09-10）**
 
+### 新会话接续入口
+
+新会话开始后先读取本节，不要重新微调 GR00T，也不要用教师 PPO checkpoint 初始化
+residual policy。教师 PPO 只用于示范采集和上限对照；FIRe residual 从头训练，GR00T
+作为独立推理服务保持冻结。
+
+开始任何 GPU 进程前依次确认：
+
+1. 当前工作区为 `/home/rim/experiment/FIRe`，分支为
+   `gr00t-peginsert-remote-training`；先执行 `git status --short --branch`，保留用户改动。
+2. 本地基线提交为 `8b4571d`。该分支相对 `origin/main` 多 4 个本地提交；截至
+   2026-09-10 推送尚未获准完成，远端不能假定已经包含当前代码。
+3. 微调模型必须使用
+   `experiments/gr00t_finetune/forge/peg_insert/n1_2b_steps20000_seed42_bs4_20260907`，
+   不得误用基础模型、smoke 模型或中间 checkpoint。
+4. 使用 `pgrep`、`nvidia-smi` 和端口检查确认没有旧 Isaac Sim、训练客户端或 5555
+   服务残留；检查本机和候选远端的可用显存。
+5. 若使用远端 GR00T server，先运行 `tailscale status` 确认目标在线，再核对远端模型、
+   `_gr00t` commit 和 Python 环境；不得把数据集、模型或密码写入 Git。
+
+本地 GR00T server 命令为：
+
+```bash
+cd /home/rim/experiment/FIRe/fire_lab
+
+/home/rim/miniconda3/bin/conda run --no-capture-output -n gr00t \
+python -u _gr00t/scripts/inference_service.py \
+  --server \
+  --model_path /home/rim/experiment/FIRe/fire_lab/experiments/gr00t_finetune/forge/peg_insert/n1_2b_steps20000_seed42_bs4_20260907 \
+  --embodiment_tag franka \
+  --data_config franka_triple_cam \
+  --denoising_steps 4 \
+  --host 127.0.0.1 \
+  --port 5555
+```
+
+必须等到服务端显示 `Server is ready` 后再启动 Isaac Sim。远端部署时服务端改用
+`--host 0.0.0.0`，训练端 `env.vla_host` 改为经核验的 Tailscale IP；不要同时启动
+本地和远端两个 5555 服务。
+
+在 1-iteration 冒烟前还要完成一次训练指标审计：当前 GR00T sparse reward 路径已经
+更新 `ep_succeeded`/`ep_success_times`，但需要确认 `successes`、`success_times`、
+`r_s`、`r_penalty`、`r_shaping` 和接触力同时写入 RL-Games 可读取的 `extras`/TensorBoard，
+而不是只依赖逐 step 的 `wandb.log()`。若缺失，先补日志并做静态测试；这属于观测性
+修复，不改变奖励数值。
+
 保持 GR00T 服务运行，在 `FIRe` 环境中执行：
 
 ```bash
@@ -610,6 +656,30 @@ python scripts/reinforcement_learning/rl_games/train.py \
    KL、entropy、episode reward、成功率、接触力、推理延迟和两端显存；不得出现 NaN、
    持续显存增长或服务请求堆积。
 
+20-iteration 冒烟不得从 1-iteration checkpoint 恢复，使用独立目录重新从头训练：
+
+```bash
+cd /home/rim/experiment/FIRe/fire_lab
+
+/home/rim/miniconda3/bin/conda run --no-capture-output -n FIRe \
+python -u scripts/reinforcement_learning/rl_games/train.py \
+  --task=FireLab-VLA-Gr00t-Forge-PegInsert-Direct-v1 \
+  --headless \
+  --enable_cameras \
+  --num_envs=4 \
+  --max_iterations=20 \
+  --seed=0 \
+  --run_name=gr00t_peginsert_residual_stability20_seed0 \
+  --save_frequency=5 \
+  env.vla_host=localhost \
+  env.vla_port=5555
+```
+
+本地 TensorBoard 日志位于
+`logs/rl_games/Forge/<run_name>/summaries`，模型位于对应 `nn/`。验收时保存环境配置、
+agent 配置、终端日志、峰值显存、服务端异常和最终 checkpoint 的绝对路径。冒烟成功
+不等同于策略有效；20 iterations 只验证可训练性和稳定性。
+
 当前 PPO 配置为 `horizon_length=128`、`minibatch_size=512`，所以不修改配置时
 `num_envs=4` 是一个完整 minibatch 的最小并行数。如果本机 16 GB GPU 无法同时承载
 GR00T server 与 4-env 三相机 Isaac Sim，优先把 GR00T server 放到 Tailscale 远端 GPU；
@@ -634,6 +704,30 @@ actor 与 central-value minibatch 都改为 256，并重新冒烟。
   保存一次。
 - 中断恢复必须显式传入该 run 的 checkpoint，并核对恢复后的 epoch、optimizer、
   scheduler 和归一化统计，禁止无意间从头覆盖同名目录。
+
+若 4-env 两道冒烟全部通过，seed 0 的正式命令模板为：
+
+```bash
+cd /home/rim/experiment/FIRe/fire_lab
+
+/home/rim/miniconda3/bin/conda run --no-capture-output -n FIRe \
+python -u scripts/reinforcement_learning/rl_games/train.py \
+  --task=FireLab-VLA-Gr00t-Forge-PegInsert-Direct-v1 \
+  --headless \
+  --enable_cameras \
+  --num_envs=4 \
+  --max_iterations=3200 \
+  --seed=0 \
+  --run_name=gr00t_peginsert_residual_frames1638400_seed0 \
+  --save_frequency=100 \
+  env.vla_host=localhost \
+  env.vla_port=5555
+```
+
+该命令只是通过冒烟后的候选正式配置。若实测改用远端 host、2 envs 或其他 horizon，
+必须重新计算总 frames 和 minibatch，并把最终命令、配置差异及理由写回本节后再启动。
+正式 run 中断时，先停止 Isaac Sim 客户端，再停止 GR00T server；恢复时顺序相反，并在
+原命令上增加 `--checkpoint=<已核验的 nn/*.pth>`，不得仅凭同名 run 目录假定自动续训。
 
 验收标准：
 
@@ -791,3 +885,12 @@ fire_deploy/
    再运行 seed 1、2并聚合均值、标准差和置信区间。
 5. PegInsert M9 完成后再回到 GearMesh/NutThread 的 GR00T 微调与 residual 复现，避免
    三个任务同时展开导致配置和结论不可追溯。
+
+新会话的第一个可交付物不是正式 checkpoint，而是一份阶段八冒烟报告，至少包含：
+
+- 本地/远端拓扑与两端 GPU 型号、峰值显存。
+- GR00T server 使用的模型绝对路径、端口和 denoising steps。
+- 1 iteration 与 20 iterations 的完整命令、run 目录、checkpoint 和退出状态。
+- VLA/residual 合成动作 shape，关键 PPO 指标是否有限，成功率/接触力日志是否可见。
+- 是否满足进入 3200-iteration seed 0 正式训练的结论；若不满足，写明唯一阻塞原因和
+  下一次最小验证动作。
