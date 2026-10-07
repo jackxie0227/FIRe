@@ -297,7 +297,11 @@ class ForgeEnv(FactoryEnv):
 
         yaw_action = (fingertip_yaw_bolt + np.deg2rad(180.0)) / np.deg2rad(270.0) * 2.0 - 1.0
         self.actions[:, 5] = self.prev_actions[:, 5] = yaw_action
-        self.actions[:, 6] = self.prev_actions[:, 6] = -1.0
+        # Legacy FORGE policies use action 6 for success prediction.  FIRe's
+        # official residual policy is pose-only (6D), so do not invent a seventh
+        # dimension for the new task.
+        if self.actions.shape[-1] > 6:
+            self.actions[:, 6] = self.prev_actions[:, 6] = -1.0
 
         # EMA randomization.
         ema_rand = torch.rand((self.num_envs, 1), dtype=torch.float32, device=self.device)
@@ -320,15 +324,30 @@ class ForgeEnv(FactoryEnv):
         self.task_prop_gains = prop_gains
         self.task_deriv_gains = factory_utils.get_deriv_gains(prop_gains)
 
-        contact_rand = torch.rand((self.num_envs,), dtype=torch.float32, device=self.device)
-        contact_lower, contact_upper = self.cfg.task.contact_penalty_threshold_range
-        self.contact_penalty_thresholds = contact_lower + contact_rand * (contact_upper - contact_lower)
+        # Always draw first so fixed-threshold evaluation preserves the random
+        # stream (dead-zone, gain, and pose samples) used by the legacy path.
+        contact_rand = torch.rand((len(env_ids),), dtype=torch.float32, device=self.device)
+        if not hasattr(self, "contact_penalty_thresholds"):
+            self.contact_penalty_thresholds = torch.zeros(
+                self.num_envs, dtype=torch.float32, device=self.device
+            )
+        fixed_threshold = getattr(self.cfg, "fixed_contact_penalty_threshold", None)
+        if fixed_threshold is None:
+            contact_lower, contact_upper = self.cfg.task.contact_penalty_threshold_range
+            self.contact_penalty_thresholds[env_ids] = contact_lower + contact_rand * (
+                contact_upper - contact_lower
+            )
+        else:
+            self.contact_penalty_thresholds[env_ids] = float(fixed_threshold)
 
         self.dead_zone_thresholds = (
             torch.rand((self.num_envs, 6), dtype=torch.float32, device=self.device) * self.default_dead_zone
         )
 
-        self.force_sensor_world_smooth[:, :] = 0.0
+        self.force_sensor_world_smooth[env_ids, :] = 0.0
+        self.force_sensor_smooth[env_ids, :] = 0.0
+        if hasattr(self, "noisy_force"):
+            self.noisy_force[env_ids, :] = 0.0
 
         self.flip_quats = torch.ones((self.num_envs,), dtype=torch.float32, device=self.device)
         rand_flips = torch.rand(self.num_envs) > 0.5

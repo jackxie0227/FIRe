@@ -562,9 +562,22 @@ experiments/evaluations/paired/peg_insert/comparison_500.json
 
 ## 9. 阶段八：FIRe 力觉残差策略冒烟测试
 
-**状态：下一步执行；不得跳过直接启动正式训练（2026-09-10）**
+**状态：已完成；允许进入 3200-iteration seed 0 正式训练，但本次未启动（2026-09-10）**
 
-### 新会话接续入口
+阶段八实测结论：
+
+- residual sparse reward 的数值公式未变；已将 completed-episode `successes`、
+  `success_times`、三项奖励和接触力写入 RL-Games `extras`，并补训练结束 TensorBoard flush。
+- 本地单卡拓扑为 RTX 5060 Ti 16 GB 同时运行冻结 GR00T server 与 4-env Isaac Sim；
+  20-iteration 整卡峰值为 13,366 MiB，后期稳定，最低约余 2,461 MiB。
+- 1 iteration 与独立 20 iterations 均从头训练、退出码 0、保存 checkpoint；PPO、奖励和
+  接触力指标全部有限，无超时、shape mismatch、NaN、OOM、请求堆积或服务异常。
+- batch-4 三相机真实协议请求预热后平均 215.935 ms/chunk，返回动作 `(4, 16, 7)`。
+- 完整报告位于 `experiments/evaluations/residual/peg_insert/stage8_smoke_20260910/stage8_smoke_report.md`。
+
+以下接续入口与命令保留为本次阶段八执行记录，不应在下一会话无故重复冒烟。
+
+### 已执行的新会话接续入口
 
 新会话开始后先读取本节，不要重新微调 GR00T，也不要用教师 PPO checkpoint 初始化
 residual policy。教师 PPO 只用于示范采集和上限对照；FIRe residual 从头训练，GR00T
@@ -864,7 +877,7 @@ fire_deploy/
 - [x] M5：完成 Forge PegInsert 正式示范数据集及 GR00T meta/statistics。
 - [x] M6：建立独立 `gr00t` Python 3.10 环境并通过单 batch 测试。
 - [x] M7：完成 PegInsert GR00T 微调、推理闭环与 VLA-only 仿真评估。
-- [ ] M8：打通 GR00T server 与 FIRe residual 训练冒烟测试。
+- [x] M8：打通 GR00T server 与 FIRe residual 训练冒烟测试。
 - [ ] M9：完成 Forge PegInsert FIRe 正式训练及多 seed 评估。
 - [ ] M10：复现 GearMesh 和 NutThread（教师模型、原始示范和正式数据集已完成；
   GR00T/FIRe 训练及评估待完成）。
@@ -873,24 +886,23 @@ fire_deploy/
 
 ## 15. 下一步
 
-当前主线转入 PegInsert M8/M9：
+当前主线转入 PegInsert M9；不要重新微调 GR00T，也不要重复阶段八冒烟。
 
-1. 启动已微调 GR00T server，执行 4-env、1-iteration residual PPO 链路冒烟；记录
-   Isaac Sim 与服务端峰值显存、单次 chunk 推理延迟和 checkpoint 路径。
-2. 链路通过后执行独立的 20-iteration 稳定性冒烟，确认 PPO 指标有限、奖励/成功率
-   可学习且无显存增长；失败时先定位链路、奖励或容量问题，不直接增加训练预算。
-3. 根据实测容量选择本地或远端 GR00T server，并锁定 `num_envs`、minibatch、seed、
-   run name、保存频率与总采样帧。4 envs 时正式单 seed 预算暂定 3200 iterations。
-4. 完成 seed 0 正式训练并用固定条件评估 GR00T + residual；确认优于 GR00T-only 后，
-   再运行 seed 1、2并聚合均值、标准差和置信区间。
+1. 新会话先检查工作区改动并阅读
+   `experiments/evaluations/residual/peg_insert/stage8_smoke_20260910/stage8_smoke_report.md`。
+2. 保留阶段八的指标观测性修复，使用阶段九给出的 4-env、3200-iteration、seed 0、
+   `save_frequency=100` 和唯一 run name 正式命令；GR00T 继续使用同一冻结正式模型。
+3. server 显示 `Server is ready` 后再启动 Isaac Sim；训练中持续记录两进程显存、
+   server 异常、TensorBoard 成功率/奖励/PPO 指标和 checkpoint，预计耗时约 45–48 小时。
+4. seed 0 完成后，用固定条件评估 GR00T + residual；只有成功率曲线高于 GR00T-only
+   起点且训练/评估稳定，才按同配置运行 seed 1、2并聚合均值、标准差和置信区间。
 5. PegInsert M9 完成后再回到 GearMesh/NutThread 的 GR00T 微调与 residual 复现，避免
    三个任务同时展开导致配置和结论不可追溯。
 
-新会话的第一个可交付物不是正式 checkpoint，而是一份阶段八冒烟报告，至少包含：
+阶段八已完成但仍需保留的运行注意事项：
 
-- 本地/远端拓扑与两端 GPU 型号、峰值显存。
-- GR00T server 使用的模型绝对路径、端口和 denoising steps。
-- 1 iteration 与 20 iterations 的完整命令、run 目录、checkpoint 和退出状态。
-- VLA/residual 合成动作 shape，关键 PPO 指标是否有限，成功率/接触力日志是否可见。
-- 是否满足进入 3200-iteration seed 0 正式训练的结论；若不满足，写明唯一阻塞原因和
-  下一次最小验证动作。
+- 本地 16 GB GPU 的实测峰值为 13,366 MiB、最低余量约 2,461 MiB；不要提高环境数。
+- GR00T server 当前实际绑定 `0.0.0.0:5555`，尽管命令传入 `--host 127.0.0.1`；
+  长时间无人值守训练前应限制网络暴露或修复上游入口对 `args.host` 的转发。
+- 正式训练中断时先停止 Isaac Sim 客户端，再停止 server；恢复时顺序相反，并显式传入
+  已核验 checkpoint，不得仅凭同名目录假定自动续训。

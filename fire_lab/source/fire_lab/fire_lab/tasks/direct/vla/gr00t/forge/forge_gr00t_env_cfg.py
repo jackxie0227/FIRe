@@ -12,7 +12,13 @@ from isaaclab.utils import configclass
 from isaaclab.sensors import TiledCameraCfg
 import isaaclab.sim as sim_utils
 
-from fire_lab.tasks.direct.vla.gr00t.forge.forge_gr00t_tasks_cfg import ForgeGr00tTask, ForgeGr00tGearMesh, ForgeGr00tNutThread, ForgeGr00tPegInsert
+from fire_lab.tasks.direct.vla.gr00t.forge.forge_gr00t_tasks_cfg import (
+    ForgeGr00tGearMesh,
+    ForgeGr00tNutThread,
+    ForgeGr00tPegInsert,
+    ForgeGr00tPegInsertOfficial,
+    ForgeGr00tTask,
+)
 from fire_lab.tasks.direct.base_line.factory.factory_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG
 from fire_lab.tasks.direct.base_line.forge.forge_env_cfg import ForgeEnvCfg
 
@@ -121,6 +127,36 @@ class ForgeTaskPegInsertGr00tCfg(ForgeGr00tEnvCfg):
     task_name = "peg_insert"
     task = ForgeGr00tPegInsert()
     episode_length_s = 10.0
+
+
+@configclass
+class ForgeTaskPegInsertGr00tOfficialCfg(ForgeGr00tEnvCfg):
+    """Website-aligned 6D FIRe residual environment.
+
+    Training samples F_ref from the task's [5, 10] N range.  Evaluation tools
+    set ``fixed_contact_penalty_threshold`` to 10 N before construction.
+    """
+
+    task_name = "peg_insert"
+    task = ForgeGr00tPegInsertOfficial()
+    episode_length_s = 10.0
+    action_space: int = 6
+    residual_action_limit: float = 1.0
+    fixed_contact_penalty_threshold: float | None = None
+    refresh_vla_on_episode_reset: bool = True
+    official_alignment_profile: str = "fire_project_page_2026-09-12"
+    obs_order: list = [
+        "fingertip_pos_rel_fixed",
+        "fingertip_quat",
+        "ee_linvel",
+        "ee_angvel",
+        "ft_force",
+    ]
+
+    def __post_init__(self):
+        # One camera update per control step is sufficient for chunk requests;
+        # rendering all eight physics substeps changes no physics or VLA input.
+        self.sim.render_interval = self.decimation
 
 @configclass
 class ForgeTaskGearMeshGr00tCfg(ForgeGr00tEnvCfg):

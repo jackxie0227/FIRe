@@ -22,6 +22,24 @@ gym.register(
     },
 )
 gym.register(
+    id="FireLab-VLA-Gr00t-Forge-PegInsert-FIReOfficial-Direct-v1",
+    entry_point=f"{__name__}.forge_gr00t_env:ForgeGr00tEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.forge_gr00t_env_cfg:ForgeTaskPegInsertGr00tOfficialCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg_peg_insert_fire_official.yaml",
+    },
+)
+gym.register(
+    id="FireLab-VLA-Gr00t-Forge-PegInsert-FIReOfficial-SampleEq4-Direct-v1",
+    entry_point=f"{__name__}.forge_gr00t_env:ForgeGr00tEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.forge_gr00t_env_cfg:ForgeTaskPegInsertGr00tOfficialCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg_peg_insert_fire_official_sampleeq4.yaml",
+    },
+)
+gym.register(
     id="FireLab-VLA-Gr00t-Forge-GearMesh-Direct-v1",
     entry_point=f"{__name__}.forge_gr00t_env:ForgeGr00tEnv",
     disable_env_checker=True,

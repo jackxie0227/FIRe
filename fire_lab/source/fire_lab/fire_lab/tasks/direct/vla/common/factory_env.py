@@ -359,18 +359,29 @@ class FactoryEnv(DirectRLVlaEnv):
         xy_dist = torch.linalg.vector_norm(target_held_base_pos[:, 0:2] - held_base_pos[:, 0:2], dim=1)
         z_disp = held_base_pos[:, 2] - target_held_base_pos[:, 2]
 
-        is_centered = torch.where(xy_dist < 0.0025, torch.ones_like(curr_successes), torch.zeros_like(curr_successes))
-        # Height threshold to target
-        fixed_cfg = self.cfg_task.fixed_asset_cfg
-        if self.cfg_task.name == "peg_insert" or self.cfg_task.name == "gear_mesh":
-            height_threshold = fixed_cfg.height * success_threshold
-        elif self.cfg_task.name == "nut_thread":
-            height_threshold = fixed_cfg.thread_pitch * success_threshold
+        official_lateral_tolerance = getattr(self.cfg_task, "success_lateral_tolerance_m", None)
+        official_depth_tolerance = getattr(self.cfg_task, "success_depth_tolerance_m", None)
+        if official_lateral_tolerance is not None and official_depth_tolerance is not None:
+            # The project page states inclusive 5 mm lateral and 25 mm depth
+            # tolerances.  Legacy tasks retain their original strict criteria.
+            is_centered = xy_dist <= official_lateral_tolerance
+            is_close_or_below = z_disp <= official_depth_tolerance
         else:
-            raise NotImplementedError("Task not implemented")
-        is_close_or_below = torch.where(
-            z_disp < height_threshold, torch.ones_like(curr_successes), torch.zeros_like(curr_successes)
-        )
+            is_centered = torch.where(
+                xy_dist < 0.0025, torch.ones_like(curr_successes), torch.zeros_like(curr_successes)
+            )
+        # Height threshold to target
+        if official_depth_tolerance is None:
+            fixed_cfg = self.cfg_task.fixed_asset_cfg
+            if self.cfg_task.name == "peg_insert" or self.cfg_task.name == "gear_mesh":
+                height_threshold = fixed_cfg.height * success_threshold
+            elif self.cfg_task.name == "nut_thread":
+                height_threshold = fixed_cfg.thread_pitch * success_threshold
+            else:
+                raise NotImplementedError("Task not implemented")
+            is_close_or_below = torch.where(
+                z_disp < height_threshold, torch.ones_like(curr_successes), torch.zeros_like(curr_successes)
+            )
         curr_successes = torch.logical_and(is_centered, is_close_or_below)
 
         if check_rot:

@@ -30,6 +30,16 @@ gym.register(
     },
 )
 
+gym.register(
+    id="FireLab-BaseLine-Forge-PegInsert-Multicam-Direct-v0",
+    entry_point=f"{__name__}.forge_multicam_env:ForgeMulticamEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.forge_multicam_env_cfg:ForgeTaskPegInsertMulticamCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg_peg_insert.yaml",
+    },
+)
+
 for stage, cfg_class in (
     (1, ForgeTaskPegInsertCurriculumStage1Cfg),
     (2, ForgeTaskPegInsertCurriculumStage2Cfg),

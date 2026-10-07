@@ -16,6 +16,7 @@ from isaaclab.envs.direct_rl_env_cfg import DirectRLEnvCfg
 from isaacsim.core.simulation_manager import SimulationManager
 
 from .utils import AsyncGr00tInferenceClient, AsyncOpenVLAInferenceClient, AsyncPi05InferenceClient
+from .vla_action import compose_vla_residual_actions
 
 
 class DirectRLVlaEnv(DirectRLEnv):
@@ -62,6 +63,16 @@ class DirectRLVlaEnv(DirectRLEnv):
 
         self.vla_actions: Dict[str, Any] | None = None
         self.processed_vla_actions: torch.Tensor | None = None
+        action_shape = (self.num_envs, self.action_space.shape[-1])
+        self._last_raw_residual_action = torch.zeros(action_shape, dtype=torch.float32, device=self.device)
+        self._last_residual_action = torch.zeros_like(self._last_raw_residual_action)
+        self._last_vla_action = torch.zeros_like(self._last_raw_residual_action)
+        self._last_combined_action = torch.zeros_like(self._last_raw_residual_action)
+        self._last_residual_clip_fraction = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._last_combined_out_of_range_fraction = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._vla_request_error_count = 0
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[VecEnvObs, dict]:
         if seed is not None:
@@ -95,11 +106,13 @@ class DirectRLVlaEnv(DirectRLEnv):
                     self.vla_actions = self.vla_policy.get_result()
                 except Exception as e:
                     print(f"Error getting {self.vla_model} action: {e}")
+                    self._vla_request_error_count += 1
                     self.vla_actions = None
 
             self.processed_vla_actions = self._parse_vla_actions(self.vla_actions)
-            print(f"vla action shape: {self.processed_vla_actions.shape}, chunk_idx: {chunk_idx}")
-            print(f"rl action shape: {action.shape}, chunk_idx: {chunk_idx}")
+            if getattr(self.cfg, "vla_debug_action_shapes", False):
+                print(f"vla action shape: {self.processed_vla_actions.shape}, chunk_idx: {chunk_idx}")
+                print(f"rl action shape: {action.shape}, chunk_idx: {chunk_idx}")
 
         elif chunk_idx == (self.vla_chunk_size // 2):
             self.vla_policy.request_action(self._get_vla_observations())
@@ -109,7 +122,25 @@ class DirectRLVlaEnv(DirectRLEnv):
             action = self._action_noise_model(action)
 
         chunk_action = self.processed_vla_actions[:, chunk_idx, :]
-        self._pre_physics_step(action + chunk_action)
+        raw_residual = action
+        residual_limit = getattr(self.cfg, "residual_action_limit", None)
+        residual, combined_action = compose_vla_residual_actions(
+            chunk_action, raw_residual, residual_limit
+        )
+
+        # These per-environment values feed complete-episode metrics.  The final
+        # action is deliberately not scaled, tanh-ed, or clipped after addition.
+        self._last_raw_residual_action = raw_residual.detach().clone()
+        self._last_residual_action = residual.detach().clone()
+        self._last_vla_action = chunk_action.detach().clone()
+        self._last_combined_action = combined_action.detach().clone()
+        self._last_residual_clip_fraction = (
+            raw_residual.ne(residual).float().mean(dim=-1)
+        )
+        self._last_combined_out_of_range_fraction = (
+            combined_action.abs().gt(1.0).float().mean(dim=-1)
+        )
+        self._pre_physics_step(combined_action)
 
         is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
 
@@ -136,6 +167,9 @@ class DirectRLVlaEnv(DirectRLEnv):
             self.sim.forward()
             if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
                 self.sim.render()
+            if getattr(self.cfg, "refresh_vla_on_episode_reset", False):
+                self.vla_actions = self.vla_policy.get_action_sync(self._get_vla_observations())
+                self.processed_vla_actions = self._parse_vla_actions(self.vla_actions)
 
         if self.cfg.events:
             if "interval" in self.event_manager.available_modes:
