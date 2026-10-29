@@ -44,6 +44,65 @@ def test_policy_commands_are_fresh_one_episode_processes(tmp_path):
             assert "env.vla_host=127.0.0.1" in command
 
 
+def test_gear_mesh_profile_uses_native_success_and_fire6d_tasks(tmp_path):
+    tasks, criterion = runner.evaluation_profile(Namespace(benchmark="gear_mesh"))
+    assert criterion == "native"
+    assert tasks["teacher"] == "FireLab-BaseLine-Forge-GearMesh-Direct-v0"
+    assert tasks["vla"] == tasks["residual"]
+    assert "GearMesh-FIRe6D" in tasks["residual"]
+    spec = {
+        "evaluator": "/fake/evaluate_paired_policy.py",
+        "teacher_checkpoint": "/fake/teacher.pth",
+        "residual_checkpoint": "/fake/residual.pth",
+        "vla_host": "127.0.0.1",
+        "vla_port": 5556,
+        "tasks": tasks,
+        "success_criterion": criterion,
+    }
+    command = runner.command_for_trial("residual", 100000, tmp_path / "result.json", spec)
+    assert command[command.index("--task") + 1] == tasks["residual"]
+    assert command[command.index("--success-criterion") + 1] == "native"
+    assert "env.vla_port=5556" in command
+
+
+def test_100_target_sets_aggregate_completion_and_filenames(tmp_path):
+    spec = {
+        "episodes": 100,
+        "condition_seed_start": 100000,
+        "teacher_checkpoint": "/fake/teacher.pth",
+        "teacher_sha256": "aa",
+        "residual_checkpoint": "/fake/residual.pth",
+        "residual_sha256": "bb",
+    }
+    committed = {policy: [] for policy in runner.POLICIES}
+    runner.save_aggregates(tmp_path, committed, [], spec)
+    assert (tmp_path / "teacher_100.json").exists()
+    assert not (tmp_path / "teacher_500.json").exists()
+    result = runner.load_json(tmp_path / "teacher_100.json")
+    assert result["requested_episodes"] == 100
+    assert result["complete"] is False
+    assert runner.load_json(tmp_path / "pairing_audit.json")["requested_groups"] == 100
+
+
+def test_gear_mesh_pairing_keeps_randomized_state_exact_but_allows_solver_drift():
+    base = {"fixed_pos": [0.6, 0.0, 0.04], "joint_pos": [0.1], "joint_vel": [1.0]}
+    group = {
+        name: {"initial_state": dict(base)} for name in runner.POLICIES
+    }
+    group["vla"]["initial_state"] = {**base, "joint_vel": [1.00056]}
+    group["residual"]["initial_state"] = {**base, "joint_vel": [1.00056]}
+    assert runner.check_triple_states(
+        group, seed=100007, atol=runner.GEAR_STATE_ATOL,
+        field_atol=runner.GEAR_STATE_TOLERANCES,
+    ) == pytest.approx(0.00056)
+    group["vla"]["initial_state"] = {**group["vla"]["initial_state"], "fixed_pos": [0.600002, 0.0, 0.04]}
+    with pytest.raises(ValueError, match="fixed_pos"):
+        runner.check_triple_states(
+            group, seed=100007, atol=runner.GEAR_STATE_ATOL,
+            field_atol=runner.GEAR_STATE_TOLERANCES,
+        )
+
+
 def _payload(policy, seed, spec, state=None, success=1):
     checkpoint = spec["teacher_checkpoint"] if policy == "teacher" else (
         spec["residual_checkpoint"] if policy == "residual" else None
@@ -124,6 +183,29 @@ def test_manifest_requires_explicit_resume_and_same_spec(tmp_path):
         runner.ensure_manifest(tmp_path, {**spec, "model_dir": "/changed"}, write=True, resume=True)
 
 
+def test_gear_manifest_migration_preserves_previous_spec(tmp_path):
+    old = {"schema_version": 1, "tasks": runner.GEAR_TASKS, "state_atol": runner.GEAR_STATE_ATOL}
+    runner.ensure_manifest(tmp_path, old, write=True, resume=False)
+    new = {**old, "state_tolerances": runner.GEAR_STATE_TOLERANCES}
+    runner.ensure_manifest(tmp_path, new, write=True, resume=True)
+    assert runner.load_json(tmp_path / "manifest.json") == new
+    assert runner.load_json(tmp_path / "manifest_before_gear_pairing_update.json") == old
+
+
+def test_gear_manifest_tolerance_upgrade_preserves_previous_spec(tmp_path):
+    old = {
+        "schema_version": 1,
+        "tasks": runner.GEAR_TASKS,
+        "state_atol": runner.GEAR_STATE_ATOL,
+        "state_tolerances": runner.GEAR_STATE_TOLERANCES_V1,
+    }
+    runner.ensure_manifest(tmp_path, old, write=True, resume=False)
+    new = {**old, "state_tolerances": runner.GEAR_STATE_TOLERANCES}
+    runner.ensure_manifest(tmp_path, new, write=True, resume=True)
+    assert runner.load_json(tmp_path / "manifest.json") == new
+    assert runner.load_json(tmp_path / "manifest_before_gear_pairing_update_v2.json") == old
+
+
 def test_one_group_then_resume_without_reexecuting_it(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "EPISODES", 2)
     monkeypatch.setattr(runner, "check_no_other_simulator", lambda: None)
@@ -161,13 +243,13 @@ def test_one_group_then_resume_without_reexecuting_it(monkeypatch, tmp_path):
     )
     runner.run(arguments)
     assert len(calls) == 3
-    assert runner.load_json(tmp_path / "teacher_500.json")["episodes"] == 1
+    assert runner.load_json(tmp_path / "teacher_2.json")["episodes"] == 1
     arguments.count = 2
     arguments.resume = True
     runner.run(arguments)
     assert len(calls) == 6
     for policy in runner.POLICIES:
-        aggregate = runner.load_json(tmp_path / f"{policy}_500.json")
+        aggregate = runner.load_json(tmp_path / f"{policy}_2.json")
         assert aggregate["episodes"] == 2
         assert aggregate["complete"] is True
         assert [trial["condition_index"] for trial in aggregate["trials"]] == [0, 1]
@@ -212,4 +294,4 @@ def test_failed_pair_is_not_aggregated(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="NOT a strict three-policy matched scene"):
         runner.run(arguments)
     assert runner.load_json(tmp_path / "pairing_failure.json")["counted"] is False
-    assert not (tmp_path / "teacher_500.json").exists()
+    assert not (tmp_path / "teacher_1.json").exists()

@@ -215,6 +215,12 @@ class ForgeGr00tEnv(ForgeEnv):
             "Action/combined_out_of_range_fraction": (
                 self._episode_combined_out_of_range[completed_ids] / steps
             ).detach(),
+            "Inference/request_error_count": torch.full_like(
+                steps, float(self._vla_request_error_count)
+            ).detach(),
+            "Inference/reset_refresh_count": torch.full_like(
+                steps, float(self._vla_reset_refresh_count)
+            ).detach(),
         }
 
     def get_sparse_rewards(self) -> torch.Tensor:

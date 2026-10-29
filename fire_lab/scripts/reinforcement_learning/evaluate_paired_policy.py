@@ -33,6 +33,7 @@ parser.add_argument("--base-seeds", nargs="+", type=int)
 parser.add_argument("--episodes-per-seed", type=int)
 parser.add_argument("--eval-num-envs", type=int, default=1)
 parser.add_argument("--output", type=Path, required=True)
+parser.add_argument("--clip-combined-action", action="store_true", help="Evaluation-only clamp of VLA plus residual to [-1, 1].")
 parser.add_argument("--resume", action="store_true", help="Resume completed trials from --output.")
 parser.add_argument(
     "--record-multicam-dir",
@@ -248,6 +249,35 @@ class _OfficialSuccessTracker:
         self.active = False
 
 
+class _NativeSuccessTracker:
+    """Preserve ever-success before terminal auto-reset clears episode fields."""
+
+    def __init__(self, task_env):
+        self.active = False
+        self.seen = torch.zeros(task_env.num_envs, dtype=torch.bool)
+        self.first_step = torch.zeros(task_env.num_envs, dtype=torch.long)
+        original_get_rewards = task_env._get_rewards
+
+        def observed_get_rewards():
+            rewards = original_get_rewards()
+            if self.active:
+                current = task_env.ep_succeeded.detach().cpu().bool()
+                first = current & ~self.seen
+                self.first_step[first] = task_env.ep_success_times.detach().cpu()[first]
+                self.seen |= current
+            return rewards
+
+        task_env._get_rewards = observed_get_rewards
+
+    def begin(self):
+        self.seen.zero_()
+        self.first_step.zero_()
+        self.active = True
+
+    def end(self):
+        self.active = False
+
+
 def _build_result(trials: list[dict], complete: bool) -> dict:
     successes = sum(trial["success"] for trial in trials)
     interval = _wilson_interval(successes, len(trials))
@@ -354,8 +384,10 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
         raise ValueError("--checkpoint is only valid for PPO or residual policy")
     if args_cli.policy in ("ppo", "residual") and not args_cli.checkpoint:
         raise ValueError("--checkpoint is required for PPO or residual policy")
-    if args_cli.policy == "residual" and "FIReOfficial" not in args_cli.task:
-        raise ValueError("Residual checkpoint requires a FIReOfficial task")
+    if args_cli.policy == "residual" and not any(
+        name in args_cli.task for name in ("FIReOfficial", "GearMesh-FIRe6D")
+    ):
+        raise ValueError("Residual checkpoint requires a FIReOfficial or GearMesh-FIRe6D task")
     if args_cli.success_criterion == OFFICIAL_SUCCESS_CRITERION and "PegInsert" not in args_cli.task:
         raise ValueError("FIRe-official PegInsert success criterion requires a PegInsert task")
 
@@ -364,16 +396,16 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
     if args_cli.device is not None:
         agent_cfg["params"]["config"]["device"] = args_cli.device
         agent_cfg["params"]["config"]["device_name"] = args_cli.device
+    # Isaac Lab also randomizes startup properties while gym.make constructs
+    # the environment. Reset-time task_env.seed() alone cannot align those
+    # properties across fresh teacher/VLA/residual simulator processes.
+    construction_seed = (
+        args_cli.base_seeds[0]
+        if args_cli.base_seeds is not None
+        else args_cli.condition_seed_start
+    )
+    env_cfg.seed = construction_seed
     if args_cli.success_criterion == OFFICIAL_SUCCESS_CRITERION:
-        # Isaac Lab also randomizes startup properties while gym.make constructs
-        # the environment. Reset-time task_env.seed() alone cannot align those
-        # properties across fresh teacher/VLA/residual simulator processes.
-        construction_seed = (
-            args_cli.base_seeds[0]
-            if args_cli.base_seeds is not None
-            else args_cli.condition_seed_start
-        )
-        env_cfg.seed = construction_seed
         if hasattr(env_cfg, "fixed_contact_penalty_threshold"):
             env_cfg.fixed_contact_penalty_threshold = 10.0
         elif hasattr(env_cfg, "task") and hasattr(env_cfg.task, "contact_penalty_threshold_range"):
@@ -413,11 +445,16 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
 
     raw_env = gym.make(args_cli.task, cfg=env_cfg)
     task_env = raw_env.unwrapped
+    if args_cli.clip_combined_action:
+        if args_cli.policy != "residual":
+            raise ValueError("--clip-combined-action requires --policy=residual")
+        task_env.eval_clip_combined_action = True
     official_tracker = (
         _OfficialSuccessTracker(task_env)
         if args_cli.success_criterion == OFFICIAL_SUCCESS_CRITERION
         else None
     )
+    native_tracker = _NativeSuccessTracker(task_env)
     required = ("ep_succeeded", "ep_success_times")
     missing = [field for field in required if not hasattr(task_env, field)]
     if missing:
@@ -478,6 +515,9 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
             zero_residual_composition_exact = torch.ones(args_cli.eval_num_envs, dtype=torch.bool)
             vla_action_abs_sum = torch.zeros(args_cli.eval_num_envs, dtype=torch.float64)
             vla_action_elements = 0
+            action_out_of_range_count = torch.zeros(args_cli.eval_num_envs, 6, dtype=torch.long)
+            action_excess_sum = torch.zeros(args_cli.eval_num_envs, 6, dtype=torch.float64)
+            action_excess_max = torch.zeros(args_cli.eval_num_envs, 6, dtype=torch.float64)
             force_sum = torch.zeros(args_cli.eval_num_envs, dtype=torch.float64)
             force_max = torch.zeros(args_cli.eval_num_envs, dtype=torch.float64)
             over_10n_steps = torch.zeros(args_cli.eval_num_envs, dtype=torch.long)
@@ -490,6 +530,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
                 multicam_buffers = {name: [] for name in MULTICAM_SENSORS}
             if official_tracker is not None:
                 official_tracker.begin()
+            native_tracker.begin()
             done = False
             max_steps = task_env.max_episode_length + 1
             while not done and step_count < max_steps and simulation_app.is_running():
@@ -515,6 +556,10 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
                             finite_step &= torch.isfinite(combined_action).all(dim=-1).detach().cpu()
                             vla_action_abs_sum += vla_action.abs().sum(dim=-1).detach().cpu().double()
                             vla_action_elements += vla_action.shape[-1]
+                            excess = (task_env._last_unclipped_combined_action[..., :6].abs() - 1.0).clamp_min(0).detach().cpu().double()
+                            action_out_of_range_count += excess.gt(0).long()
+                            action_excess_sum += excess
+                            action_excess_max = torch.maximum(action_excess_max, excess)
                         output_is_finite &= finite_step
                     else:
                         action = torch.zeros(raw_env.action_space.shape, device=task_env.device)
@@ -549,6 +594,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
                 force_sum = official_tracker.force_sum
                 force_max = official_tracker.force_max
                 over_10n_steps = official_tracker.over_10n_steps
+            native_tracker.end()
 
             if not done:
                 raise RuntimeError(f"Condition {condition_seed} did not terminate within {max_steps} steps")
@@ -561,7 +607,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
                     fps=round(1.0 / task_env.step_dt),
                 )
 
-            native_success_batch = task_env.ep_succeeded.detach().cpu().gt(0).int()
+            native_success_batch = native_tracker.seen.int()
             succeeded_batch = (
                 official_tracker.seen.int()
                 if args_cli.success_criterion == OFFICIAL_SUCCESS_CRITERION
@@ -586,7 +632,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
                     "first_success_step": (
                         int(official_tracker.first_step[env_index].item())
                         if succeeded and args_cli.success_criterion == OFFICIAL_SUCCESS_CRITERION
-                        else int(task_env.ep_success_times[env_index].item()) if succeeded else None
+                        else int(native_tracker.first_step[env_index].item()) if succeeded else None
                     ),
                     "contact_force_mean_n": float(force_sum[env_index].item() / step_count),
                     "contact_force_max_n": float(force_max[env_index].item()),
@@ -600,6 +646,11 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
                     "vla_action_abs_mean": float(
                         vla_action_abs_sum[env_index].item() / max(vla_action_elements, 1)
                     ),
+                    "combined_action_clip_mode": "post_sum" if args_cli.clip_combined_action else "none",
+                    "combined_action_out_of_range_count_by_dim": action_out_of_range_count[env_index].tolist() if args_cli.policy == "residual" else None,
+                    "combined_action_out_of_range_fraction": float(action_out_of_range_count[env_index].sum().item() / (step_count * 6)) if args_cli.policy == "residual" else None,
+                    "combined_action_excess_mean_by_dim": (action_excess_sum[env_index] / step_count).tolist() if args_cli.policy == "residual" else None,
+                    "combined_action_excess_max_by_dim": action_excess_max[env_index].tolist() if args_cli.policy == "residual" else None,
                     "vla_request_error_count": request_error_delta if env_index == 0 else 0,
                     "initial_state": initial_states[env_index],
                 }

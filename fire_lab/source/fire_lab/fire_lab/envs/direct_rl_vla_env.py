@@ -17,6 +17,7 @@ from isaacsim.core.simulation_manager import SimulationManager
 
 from .utils import AsyncGr00tInferenceClient, AsyncOpenVLAInferenceClient, AsyncPi05InferenceClient
 from .vla_action import compose_vla_residual_actions
+from .strict_gr00t import refresh_episode_chunk, require_synchronized_reset, validate_pose_chunk
 
 
 class DirectRLVlaEnv(DirectRLEnv):
@@ -73,6 +74,8 @@ class DirectRLVlaEnv(DirectRLEnv):
             self.num_envs, dtype=torch.float32, device=self.device
         )
         self._vla_request_error_count = 0
+        self._vla_async_pending = False
+        self._vla_reset_refresh_count = 0
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[VecEnvObs, dict]:
         if seed is not None:
@@ -91,8 +94,32 @@ class DirectRLVlaEnv(DirectRLEnv):
             while SimulationManager.assets_loading():
                 self.sim.render()
 
-        self.vla_actions = self.vla_policy.get_action_sync(self._get_vla_observations())
-        self.processed_vla_actions = self._parse_vla_actions(self.vla_actions)
+        observations = self._get_vla_observations()
+        if getattr(self.cfg, "strict_gr00t_response", False):
+            try:
+                self.vla_actions, self.processed_vla_actions = refresh_episode_chunk(
+                    self.vla_policy, observations, self._parse_vla_actions,
+                    pending=self._vla_async_pending,
+                )
+            except Exception as e:
+                self._vla_request_error_count += 1
+                raise RuntimeError(
+                    f"GearMesh GR00T initial reset inference failed for {self.num_envs} environments, "
+                    f"request_errors={self._vla_request_error_count}: {e}"
+                ) from e
+            self._vla_async_pending = False
+        else:
+            self.vla_actions = self.vla_policy.get_action_sync(observations)
+            try:
+                self.processed_vla_actions = self._parse_vla_actions(self.vla_actions)
+            except Exception as e:
+                if getattr(self.cfg, "strict_gr00t_response", False):
+                    self._vla_request_error_count += 1
+                    raise RuntimeError(
+                        f"GearMesh GR00T chunk validation failed at episode step {t}, "
+                        f"envs={self.num_envs}, request_errors={self._vla_request_error_count}: {e}"
+                    ) from e
+                raise
 
         return self._get_observations(), self.extras
 
@@ -104,9 +131,15 @@ class DirectRLVlaEnv(DirectRLEnv):
             if t != 0:
                 try:
                     self.vla_actions = self.vla_policy.get_result()
+                    self._vla_async_pending = False
                 except Exception as e:
-                    print(f"Error getting {self.vla_model} action: {e}")
                     self._vla_request_error_count += 1
+                    if getattr(self.cfg, "strict_gr00t_response", False):
+                        raise RuntimeError(
+                            f"GearMesh GR00T async inference failed at episode step {t}, "
+                            f"envs={self.num_envs}, request_errors={self._vla_request_error_count}: {e}"
+                        ) from e
+                    print(f"Error getting {self.vla_model} action: {e}")
                     self.vla_actions = None
 
             self.processed_vla_actions = self._parse_vla_actions(self.vla_actions)
@@ -115,7 +148,17 @@ class DirectRLVlaEnv(DirectRLEnv):
                 print(f"rl action shape: {action.shape}, chunk_idx: {chunk_idx}")
 
         elif chunk_idx == (self.vla_chunk_size // 2):
-            self.vla_policy.request_action(self._get_vla_observations())
+            try:
+                self.vla_policy.request_action(self._get_vla_observations())
+            except Exception as e:
+                if getattr(self.cfg, "strict_gr00t_response", False):
+                    self._vla_request_error_count += 1
+                    raise RuntimeError(
+                        f"GearMesh GR00T request failed at episode step {t}, "
+                        f"envs={self.num_envs}, request_errors={self._vla_request_error_count}: {e}"
+                    ) from e
+                raise
+            self._vla_async_pending = True
 
         action = action.to(self.device)
         if self.cfg.action_noise_model:
@@ -127,9 +170,12 @@ class DirectRLVlaEnv(DirectRLEnv):
         residual, combined_action = compose_vla_residual_actions(
             chunk_action, raw_residual, residual_limit
         )
+        # Evaluation-only switch. Keep the unclipped sum for diagnostics.
+        self._last_unclipped_combined_action = combined_action.detach().clone()
+        if getattr(self, "eval_clip_combined_action", False):
+            combined_action = combined_action.clamp(-1.0, 1.0)
 
-        # These per-environment values feed complete-episode metrics.  The final
-        # action is deliberately not scaled, tanh-ed, or clipped after addition.
+        # These per-environment values feed complete-episode metrics.
         self._last_raw_residual_action = raw_residual.detach().clone()
         self._last_residual_action = residual.detach().clone()
         self._last_vla_action = chunk_action.detach().clone()
@@ -138,7 +184,7 @@ class DirectRLVlaEnv(DirectRLEnv):
             raw_residual.ne(residual).float().mean(dim=-1)
         )
         self._last_combined_out_of_range_fraction = (
-            combined_action.abs().gt(1.0).float().mean(dim=-1)
+            self._last_unclipped_combined_action.abs().gt(1.0).float().mean(dim=-1)
         )
         self._pre_physics_step(combined_action)
 
@@ -162,14 +208,33 @@ class DirectRLVlaEnv(DirectRLEnv):
 
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
+            strict = getattr(self.cfg, "strict_gr00t_response", False)
+            if strict:
+                require_synchronized_reset(reset_env_ids, self.num_envs)
             self._reset_idx(reset_env_ids)
             self.scene.write_data_to_sim()
             self.sim.forward()
             if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
                 self.sim.render()
             if getattr(self.cfg, "refresh_vla_on_episode_reset", False):
-                self.vla_actions = self.vla_policy.get_action_sync(self._get_vla_observations())
-                self.processed_vla_actions = self._parse_vla_actions(self.vla_actions)
+                observations = self._get_vla_observations()
+                if strict:
+                    try:
+                        self.vla_actions, self.processed_vla_actions = refresh_episode_chunk(
+                            self.vla_policy, observations, self._parse_vla_actions,
+                            pending=self._vla_async_pending,
+                        )
+                    except Exception as e:
+                        self._vla_request_error_count += 1
+                        raise RuntimeError(
+                            f"GearMesh GR00T reset inference failed for envs={reset_env_ids.tolist()}, "
+                            f"request_errors={self._vla_request_error_count}: {e}"
+                        ) from e
+                    self._vla_async_pending = False
+                    self._vla_reset_refresh_count += 1
+                else:
+                    self.vla_actions = self.vla_policy.get_action_sync(observations)
+                    self.processed_vla_actions = self._parse_vla_actions(self.vla_actions)
 
         if self.cfg.events:
             if "interval" in self.event_manager.available_modes:
@@ -192,6 +257,10 @@ class DirectRLVlaEnv(DirectRLEnv):
         raise ValueError(f"Unsupported vla_model '{self.vla_model}'.")
 
     def _parse_gr00t_actions(self, out: Dict[str, Any] | None) -> torch.Tensor:
+        if getattr(self.cfg, "strict_gr00t_response", False):
+            return validate_pose_chunk(
+                out, num_envs=self.num_envs, chunk_size=self.vla_chunk_size, device=self.device
+            )
         if out is None or "action.eef_position_delta" not in out or "action.eef_rotation_delta" not in out:
             return self._zero_vla_actions()
 

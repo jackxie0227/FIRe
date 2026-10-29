@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run a strict 500-condition, three-policy comparison with fresh Isaac processes.
+"""Run a strict three-policy comparison with fresh Isaac processes per condition.
 
 The existing multi-episode evaluator has shown history-dependent reset drift.
 Therefore every (condition seed, policy) is evaluated by a new simulator process.
-Only complete triples whose recorded initial states agree within 1e-5 enter the
-three aggregate results.  The GR00T inference service is started separately.
+Only complete triples whose recorded initial states pass the benchmark's
+field-specific pairing rules enter the three aggregate results.
 """
 
 from __future__ import annotations
@@ -23,6 +23,39 @@ from pathlib import Path
 EPISODES = 500
 DEFAULT_SEED_START = 100000
 STATE_ATOL = 1.0e-5
+GEAR_STATE_ATOL = 5.0e-4
+GEAR_STATE_TOLERANCES_V1 = {
+    # Reset targets and randomized controller parameters must be identical.
+    "fixed_pos": 1.0e-6,
+    "fixed_quat": 1.0e-6,
+    "init_fixed_pos_obs_noise": 1.0e-6,
+    "task_prop_gains": 1.0e-6,
+    "ema_factor": 1.0e-6,
+    "pos_threshold": 1.0e-6,
+    "rot_threshold": 1.0e-6,
+    "contact_penalty_thresholds": 1.0e-6,
+    "dead_zone_thresholds": 1.0e-6,
+    # Different camera/render schedules cause small solver drift after reset.
+    "held_pos": 1.0e-4,
+    "fingertip_midpoint_pos": 1.0e-4,
+    "held_quat": 5.0e-4,
+    "fingertip_midpoint_quat": 5.0e-4,
+    "joint_pos": 2.0e-4,
+    "fingertip_midpoint_linvel": 5.0e-3,
+    "fingertip_midpoint_angvel": 5.0e-3,
+    "joint_vel": 5.0e-3,
+}
+GEAR_STATE_TOLERANCES = {
+    **GEAR_STATE_TOLERANCES_V1,
+    "held_pos": 5.0e-4,
+    "fingertip_midpoint_pos": 5.0e-4,
+    "held_quat": 5.0e-3,
+    "fingertip_midpoint_quat": 5.0e-3,
+    "joint_pos": 5.0e-3,
+    "fingertip_midpoint_linvel": 5.0e-2,
+    "fingertip_midpoint_angvel": 5.0e-2,
+    "joint_vel": 5.0e-2,
+}
 CRITERION = "fire_official_peg_insert_xy_le_0.005_z_le_0.025_ever"
 TEACHER_TASK = "FireLab-BaseLine-Forge-PegInsert-Direct-v0"
 OFFICIAL_TASK = "FireLab-VLA-Gr00t-Forge-PegInsert-FIReOfficial-SampleEq4-Direct-v1"
@@ -30,6 +63,17 @@ EVALUATOR = Path(__file__).with_name("evaluate_paired_policy.py")
 POLICIES = ("teacher", "vla", "residual")
 EVALUATOR_POLICIES = {"teacher": "ppo", "vla": "gr00t", "residual": "residual"}
 TASKS = {"teacher": TEACHER_TASK, "vla": OFFICIAL_TASK, "residual": OFFICIAL_TASK}
+GEAR_TASKS = {
+    "teacher": "FireLab-BaseLine-Forge-GearMesh-Direct-v0",
+    "vla": "FireLab-VLA-Gr00t-Forge-GearMesh-FIRe6D-Direct-v1",
+    "residual": "FireLab-VLA-Gr00t-Forge-GearMesh-FIRe6D-Direct-v1",
+}
+
+
+def evaluation_profile(args: argparse.Namespace) -> tuple[dict[str, str], str]:
+    if getattr(args, "benchmark", "peg_insert") == "gear_mesh":
+        return GEAR_TASKS, "native"
+    return TASKS, CRITERION
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,10 +82,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-checkpoint", type=Path, required=True)
     parser.add_argument("--residual-checkpoint", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--benchmark", choices=("peg_insert", "gear_mesh"), default="peg_insert")
+    parser.add_argument("--target-episodes", type=int, default=EPISODES)
     parser.add_argument("--vla-host", default="127.0.0.1")
     parser.add_argument("--vla-port", type=int, default=5555)
     parser.add_argument("--condition-seed-start", type=int, default=DEFAULT_SEED_START)
-    parser.add_argument("--count", type=int, default=EPISODES, help="Run the first N of 500 conditions; use 1 for a preflight triplet.")
+    parser.add_argument("--count", type=int, help="Run the first N conditions; defaults to --target-episodes.")
     parser.add_argument("--resume", action="store_true", help="Reuse checked single-condition results from this output directory.")
     parser.add_argument("--preflight-only", action="store_true")
     return parser.parse_args()
@@ -78,6 +124,8 @@ def load_json(path: Path) -> dict:
 
 
 def model_and_checkpoint_spec(args: argparse.Namespace) -> dict:
+    tasks, criterion = evaluation_profile(args)
+    target_episodes = getattr(args, "target_episodes", EPISODES)
     teacher = args.teacher_checkpoint.expanduser().resolve()
     residual = args.residual_checkpoint.expanduser().resolve()
     model_dir = args.model_dir.expanduser().resolve()
@@ -92,14 +140,14 @@ def model_and_checkpoint_spec(args: argparse.Namespace) -> dict:
         raise FileNotFoundError(f"Missing GR00T model config or weights in {model_dir}")
     if not EVALUATOR.is_file():
         raise FileNotFoundError(f"Missing evaluator: {EVALUATOR}")
-    return {
+    spec = {
         "schema_version": 1,
-        "episodes": EPISODES,
+        "episodes": target_episodes,
         "condition_seed_start": args.condition_seed_start,
-        "condition_seed_end": args.condition_seed_start + EPISODES - 1,
-        "success_criterion": CRITERION,
-        "state_atol": STATE_ATOL,
-        "tasks": TASKS,
+        "condition_seed_end": args.condition_seed_start + target_episodes - 1,
+        "success_criterion": criterion,
+        "state_atol": GEAR_STATE_ATOL if getattr(args, "benchmark", "peg_insert") == "gear_mesh" else STATE_ATOL,
+        "tasks": tasks,
         "teacher_checkpoint": str(teacher),
         "teacher_sha256": sha256_file(teacher),
         "residual_checkpoint": str(residual),
@@ -112,6 +160,9 @@ def model_and_checkpoint_spec(args: argparse.Namespace) -> dict:
         "evaluator": str(EVALUATOR.resolve()),
         "evaluator_sha256": sha256_file(EVALUATOR),
     }
+    if getattr(args, "benchmark", "peg_insert") == "gear_mesh":
+        spec["state_tolerances"] = GEAR_STATE_TOLERANCES
+    return spec
 
 
 def check_service(host: str, port: int) -> None:
@@ -155,6 +206,26 @@ def ensure_manifest(output_dir: Path, spec: dict, *, write: bool, resume: bool) 
         if not resume and write:
             raise ValueError(f"Output run already exists; pass --resume to reuse it: {output_dir}")
         previous = load_json(manifest)
+        legacy = {key: value for key, value in spec.items() if key != "state_tolerances"}
+        if (
+            write and resume and "state_tolerances" in spec and previous == legacy
+            and previous.get("tasks") == GEAR_TASKS
+        ):
+            backup = output_dir / "manifest_before_gear_pairing_update.json"
+            if not backup.exists():
+                atomic_json(backup, previous)
+            atomic_json(manifest, spec)
+            previous = spec
+        previous_tolerances = {**spec, "state_tolerances": GEAR_STATE_TOLERANCES_V1}
+        if (
+            write and resume and "state_tolerances" in spec and previous == previous_tolerances
+            and previous.get("tasks") == GEAR_TASKS
+        ):
+            backup = output_dir / "manifest_before_gear_pairing_update_v2.json"
+            if not backup.exists():
+                atomic_json(backup, previous)
+            atomic_json(manifest, spec)
+            previous = spec
         if previous != spec:
             different = [key for key in sorted(set(previous) | set(spec)) if previous.get(key) != spec.get(key)]
             raise ValueError(f"Existing output manifest is incompatible: {different}")
@@ -169,6 +240,8 @@ def trial_path(output_dir: Path, seed: int, policy: str) -> Path:
 
 
 def validate_trial(payload: dict, *, policy: str, seed: int, spec: dict) -> dict:
+    tasks = spec.get("tasks", TASKS)
+    criterion = spec.get("success_criterion", CRITERION)
     expected_checkpoint = (
         spec["teacher_checkpoint"] if policy == "teacher" else spec["residual_checkpoint"]
         if policy == "residual" else None
@@ -179,13 +252,13 @@ def validate_trial(payload: dict, *, policy: str, seed: int, spec: dict) -> dict
     )
     expected = {
         "policy": EVALUATOR_POLICIES[policy],
-        "task": TASKS[policy],
+        "task": tasks[policy],
         "checkpoint": expected_checkpoint,
         "checkpoint_sha256": expected_checkpoint_sha256,
         "episodes": 1,
         "requested_episodes": 1,
         "condition_seed_start": seed,
-        "success_criterion": CRITERION,
+        "success_criterion": criterion,
         "complete": True,
         "all_outputs_finite": True,
         "vla_request_error_count": 0,
@@ -225,30 +298,44 @@ def _numbers(value):
         raise ValueError(f"Invalid initial-state entry: {value!r}")
 
 
-def state_difference(left: dict, right: dict) -> float:
+def state_field_differences(left: dict, right: dict) -> dict[str, float]:
     if left.keys() != right.keys():
         raise ValueError(f"Initial-state fields differ: {sorted(left.keys() ^ right.keys())}")
-    maximum = 0.0
+    differences = {}
     for field in left:
         lhs = list(_numbers(left[field]))
         rhs = list(_numbers(right[field]))
         if len(lhs) != len(rhs):
             raise ValueError(f"Initial-state shape differs for {field}")
-        maximum = max(maximum, *(abs(a - b) for a, b in zip(lhs, rhs)))
-    return maximum
+        differences[field] = max((abs(a - b) for a, b in zip(lhs, rhs)), default=0.0)
+    return differences
 
 
-def check_triple_states(trials: dict[str, dict], *, seed: int) -> float:
+def state_difference(left: dict, right: dict) -> float:
+    return max(state_field_differences(left, right).values(), default=0.0)
+
+
+def check_triple_states(
+    trials: dict[str, dict], *, seed: int, atol: float = STATE_ATOL,
+    field_atol: dict[str, float] | None = None,
+) -> float:
     pairs = (("teacher", "vla"), ("teacher", "residual"), ("vla", "residual"))
-    differences = {
-        f"{a}_vs_{b}": state_difference(trials[a]["initial_state"], trials[b]["initial_state"])
+    field_differences = {
+        f"{a}_vs_{b}": state_field_differences(trials[a]["initial_state"], trials[b]["initial_state"])
         for a, b in pairs
     }
+    differences = {pair: max(fields.values(), default=0.0) for pair, fields in field_differences.items()}
     maximum = max(differences.values())
-    if maximum > STATE_ATOL:
+    violations = {
+        f"{pair}.{field}": (difference, field_atol.get(field, atol) if field_atol else atol)
+        for pair, fields in field_differences.items()
+        for field, difference in fields.items()
+        if difference > (field_atol.get(field, atol) if field_atol else atol)
+    }
+    if violations:
         raise ValueError(
             f"Seed {seed} is NOT a strict three-policy matched scene: {differences}; "
-            f"tolerance={STATE_ATOL}. Stop and diagnose; do not count this group."
+            f"violations={violations}. Stop and diagnose; do not count this group."
         )
     return maximum
 
@@ -265,12 +352,13 @@ def wilson(successes: int, trials: int) -> list[float]:
 
 
 def aggregate_payload(policy: str, trials: list[dict], spec: dict) -> dict:
+    target_episodes = spec.get("episodes", EPISODES)
     successes = sum(int(trial["success"]) for trial in trials)
     return {
         "schema_version": 2,
         "policy": EVALUATOR_POLICIES[policy],
         "policy_label": policy,
-        "task": TASKS[policy],
+        "task": spec.get("tasks", TASKS)[policy],
         "checkpoint": (
             spec["teacher_checkpoint"] if policy == "teacher" else spec["residual_checkpoint"]
             if policy == "residual" else None
@@ -280,11 +368,12 @@ def aggregate_payload(policy: str, trials: list[dict], spec: dict) -> dict:
             if policy == "residual" else None
         ),
         "episodes": len(trials),
-        "requested_episodes": EPISODES,
+        "requested_episodes": target_episodes,
         "condition_seed_start": spec["condition_seed_start"],
-        "success_criterion": CRITERION,
-        "initial_state_atol": STATE_ATOL,
-        "complete": len(trials) == EPISODES,
+        "success_criterion": spec.get("success_criterion", CRITERION),
+        "initial_state_atol": spec.get("state_atol", STATE_ATOL),
+        "initial_state_tolerances": spec.get("state_tolerances"),
+        "complete": len(trials) == target_episodes,
         "success_count": successes,
         "success_rate": successes / len(trials) if trials else 0.0,
         "success_rate_wilson_95": wilson(successes, len(trials)),
@@ -296,16 +385,18 @@ def aggregate_payload(policy: str, trials: list[dict], spec: dict) -> dict:
 
 
 def save_aggregates(output_dir: Path, committed: dict[str, list[dict]], differences: list[dict], spec: dict) -> None:
+    target_episodes = spec.get("episodes", EPISODES)
     for policy in POLICIES:
-        atomic_json(output_dir / f"{policy}_500.json", aggregate_payload(policy, committed[policy], spec))
+        atomic_json(output_dir / f"{policy}_{target_episodes}.json", aggregate_payload(policy, committed[policy], spec))
     atomic_json(
         output_dir / "pairing_audit.json",
         {
             "schema_version": 1,
-            "state_atol": STATE_ATOL,
+            "state_atol": spec.get("state_atol", STATE_ATOL),
+            "state_tolerances": spec.get("state_tolerances"),
             "matched_groups": len(differences),
-            "requested_groups": EPISODES,
-            "complete": len(differences) == EPISODES,
+            "requested_groups": target_episodes,
+            "complete": len(differences) == target_episodes,
             "max_initial_state_abs_difference": max((item["max_abs_difference"] for item in differences), default=0.0),
             "groups": differences,
         },
@@ -318,11 +409,11 @@ def command_for_trial(policy: str, seed: int, output: Path, spec: dict) -> list[
         "-u",
         spec["evaluator"],
         "--policy", EVALUATOR_POLICIES[policy],
-        "--task", TASKS[policy],
+        "--task", spec.get("tasks", TASKS)[policy],
         "--episodes", "1",
         "--condition-seed-start", str(seed),
         "--eval-num-envs", "1",
-        "--success-criterion", CRITERION,
+        "--success-criterion", spec.get("success_criterion", CRITERION),
         "--output", str(output),
         "--headless",
         "--enable_cameras",
@@ -358,8 +449,12 @@ def run_one(policy: str, seed: int, output_dir: Path, spec: dict) -> dict:
 
 
 def run(args: argparse.Namespace) -> None:
-    if not 1 <= args.count <= EPISODES:
-        raise ValueError(f"--count must be between 1 and {EPISODES}")
+    target_episodes = getattr(args, "target_episodes", EPISODES)
+    count = args.count if args.count is not None else target_episodes
+    if not 1 <= target_episodes <= EPISODES:
+        raise ValueError(f"--target-episodes must be between 1 and {EPISODES}")
+    if not 1 <= count <= target_episodes:
+        raise ValueError(f"--count must be between 1 and {target_episodes}")
     if args.condition_seed_start < 0:
         raise ValueError("--condition-seed-start must be nonnegative")
     output_dir = args.output_dir.expanduser().resolve()
@@ -373,11 +468,14 @@ def run(args: argparse.Namespace) -> None:
 
     committed: dict[str, list[dict]] = {policy: [] for policy in POLICIES}
     differences: list[dict] = []
-    for index in range(args.count):
+    for index in range(count):
         seed = args.condition_seed_start + index
         group = {policy: run_one(policy, seed, output_dir, spec) for policy in POLICIES}
         try:
-            max_difference = check_triple_states(group, seed=seed)
+            max_difference = check_triple_states(
+                group, seed=seed, atol=spec.get("state_atol", STATE_ATOL),
+                field_atol=spec.get("state_tolerances"),
+            )
         except ValueError as exc:
             atomic_json(
                 output_dir / "pairing_failure.json",
@@ -389,13 +487,16 @@ def run(args: argparse.Namespace) -> None:
             trial["condition_index"] = index
             committed[policy].append(trial)
         differences.append({"condition_seed": seed, "max_abs_difference": max_difference})
+        failure_path = output_dir / "pairing_failure.json"
+        if failure_path.exists() and load_json(failure_path).get("condition_seed") == seed:
+            failure_path.unlink()
         save_aggregates(output_dir, committed, differences, spec)
         summary = " ".join(f"{policy}={sum(t['success'] for t in committed[policy])}/{len(committed[policy])}" for policy in POLICIES)
-        print(f"[MATCHED] {len(differences)}/{EPISODES} seed={seed} max_state_diff={max_difference:.3g} {summary}", flush=True)
-    if len(differences) == EPISODES:
-        print("[COMPLETE] 500 strictly matched conditions for all three policies", flush=True)
+        print(f"[MATCHED] {len(differences)}/{target_episodes} seed={seed} max_state_diff={max_difference:.3g} {summary}", flush=True)
+    if len(differences) == target_episodes:
+        print(f"[COMPLETE] {target_episodes} strictly matched conditions for all three policies", flush=True)
     else:
-        print(f"[PAUSED] {len(differences)}/{EPISODES} matched conditions; rerun the same command to resume", flush=True)
+        print(f"[PAUSED] {len(differences)}/{target_episodes} matched conditions; rerun the same command to resume", flush=True)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from .forge_env_cfg import (
     ForgeTaskPegInsertCurriculumStage2Cfg,
     ForgeTaskPegInsertCurriculumStage3Cfg,
 )
+from .openarm_peg_insert import OpenArmForgePegInsertCfg, OpenArmForgePegInsertEnv
 
 ##
 # Register Gym environments.
@@ -26,6 +27,16 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.forge_env_cfg:ForgeTaskPegInsertCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg_peg_insert.yaml",
+    },
+)
+
+gym.register(
+    id="FireLab-BaseLine-Forge-OpenArm-PegInsert-Direct-v0",
+    entry_point=f"{__name__}.openarm_peg_insert:OpenArmForgePegInsertEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.openarm_peg_insert:OpenArmForgePegInsertCfg",
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg_peg_insert.yaml",
     },
 )

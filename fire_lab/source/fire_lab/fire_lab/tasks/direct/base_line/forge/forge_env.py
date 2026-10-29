@@ -33,7 +33,7 @@ class ForgeEnv(FactoryEnv):
         self.flip_quats = torch.ones((self.num_envs,), dtype=torch.float32, device=self.device)
 
         # Force sensor information.
-        self.force_sensor_body_idx = self._robot.body_names.index("force_sensor")
+        self.force_sensor_body_idx = self._robot.body_names.index(self.cfg.force_sensor_body_name)
         self.force_sensor_smooth = torch.zeros((self.num_envs, 6), device=self.device)
         self.force_sensor_world_smooth = torch.zeros((self.num_envs, 6), device=self.device)
 
@@ -92,9 +92,7 @@ class ForgeEnv(FactoryEnv):
         self.prev_fingertip_quat = self.noisy_fingertip_quat.clone()
 
         # Update and smooth force values.
-        self.force_sensor_world = self._robot.root_physx_view.get_link_incoming_joint_force()[
-            :, self.force_sensor_body_idx
-        ]
+        self.force_sensor_world = self._read_force_sensor_world()
 
         alpha = self.cfg.ft_smoothing_factor
         self.force_sensor_world_smooth = alpha * self.force_sensor_world + (1 - alpha) * self.force_sensor_world_smooth
@@ -112,6 +110,9 @@ class ForgeEnv(FactoryEnv):
         force_noise = torch.randn((self.num_envs, 3), dtype=torch.float32, device=self.device)
         force_noise *= self.cfg.obs_rand.ft_force
         self.noisy_force = self.force_sensor_smooth[:, 0:3] + force_noise
+
+    def _read_force_sensor_world(self):
+        return self._robot.root_physx_view.get_link_incoming_joint_force()[:, self.force_sensor_body_idx]
 
     def _get_observations(self):
         """Add additional FORGE observations."""

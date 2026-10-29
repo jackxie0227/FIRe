@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Strictly compare teacher, VLA, and VLA+residual on the same 500 conditions.
+"""Strictly compare teacher, VLA, and VLA+residual on matched conditions.
 
 Unlike the older two-policy comparison, this tool never drops mismatched trials.
-An output is written only when all 500 conditions pass the pairing and data gates.
+An output is written only when all requested conditions pass the pairing and data gates.
 """
 
 from __future__ import annotations
@@ -22,6 +22,30 @@ TASK_IDS = {
     "teacher": "FireLab-BaseLine-Forge-PegInsert-Direct-v0",
     "vla": "FireLab-VLA-Gr00t-Forge-PegInsert-FIReOfficial-SampleEq4-Direct-v1",
     "residual": "FireLab-VLA-Gr00t-Forge-PegInsert-FIReOfficial-SampleEq4-Direct-v1",
+}
+GEAR_TASK_IDS = {
+    "teacher": "FireLab-BaseLine-Forge-GearMesh-Direct-v0",
+    "vla": "FireLab-VLA-Gr00t-Forge-GearMesh-FIRe6D-Direct-v1",
+    "residual": "FireLab-VLA-Gr00t-Forge-GearMesh-FIRe6D-Direct-v1",
+}
+GEAR_STATE_TOLERANCES = {
+    "fixed_pos": 1.0e-6,
+    "fixed_quat": 1.0e-6,
+    "init_fixed_pos_obs_noise": 1.0e-6,
+    "task_prop_gains": 1.0e-6,
+    "ema_factor": 1.0e-6,
+    "pos_threshold": 1.0e-6,
+    "rot_threshold": 1.0e-6,
+    "contact_penalty_thresholds": 1.0e-6,
+    "dead_zone_thresholds": 1.0e-6,
+    "held_pos": 5.0e-4,
+    "fingertip_midpoint_pos": 5.0e-4,
+    "held_quat": 5.0e-3,
+    "fingertip_midpoint_quat": 5.0e-3,
+    "joint_pos": 5.0e-3,
+    "fingertip_midpoint_linvel": 5.0e-2,
+    "fingertip_midpoint_angvel": 5.0e-2,
+    "joint_vel": 5.0e-2,
 }
 PAIR_NAMES = (("teacher", "vla"), ("teacher", "residual"), ("vla", "residual"))
 EXPECTED_CRITERION = "fire_official_peg_insert_xy_le_0.005_z_le_0.025_ever"
@@ -106,12 +130,12 @@ def _mcnemar_exact(left_only: int, right_only: int) -> float:
     return min(1.0, 2.0 * tail / (2**discordant))
 
 
-def _validate_run(label: str, result: dict[str, Any], episodes: int, criterion: str) -> list[dict]:
+def _validate_run(label: str, result: dict[str, Any], episodes: int, criterion: str, task_ids: dict[str, str]) -> list[dict]:
     _finite_tree(result, path=label)
     if result.get("policy") != POLICY_LABELS[label]:
         raise ValueError(f"{label}: policy label must be {POLICY_LABELS[label]!r}")
-    if result.get("task") != TASK_IDS[label]:
-        raise ValueError(f"{label}: task must be {TASK_IDS[label]!r}")
+    if result.get("task") != task_ids[label]:
+        raise ValueError(f"{label}: task must be {task_ids[label]!r}")
     checkpoint = result.get("checkpoint")
     digest = result.get("checkpoint_sha256")
     if label == "vla":
@@ -177,13 +201,19 @@ def compare(
     *,
     episodes: int = 500,
     state_atol: float = 1.0e-5,
+    benchmark: str = "peg_insert",
 ) -> dict[str, Any]:
-    if episodes <= 0 or not math.isfinite(state_atol) or not 0 <= state_atol <= 1.0e-5:
-        raise ValueError("episodes must be positive and state_atol must be within [0, 1e-5]")
+    if benchmark not in ("peg_insert", "gear_mesh"):
+        raise ValueError(f"Unknown benchmark: {benchmark}")
+    maximum_atol = 5.0e-4 if benchmark == "gear_mesh" else 1.0e-5
+    if episodes <= 0 or not math.isfinite(state_atol) or not 0 <= state_atol <= maximum_atol:
+        raise ValueError(f"episodes must be positive and state_atol must be within [0, {maximum_atol}]")
     if set(results) != set(POLICIES):
         raise ValueError(f"Expected exactly these policies: {POLICIES}")
+    criterion = "native" if benchmark == "gear_mesh" else EXPECTED_CRITERION
+    task_ids = GEAR_TASK_IDS if benchmark == "gear_mesh" else TASK_IDS
     trials_by_policy = {
-        name: _validate_run(name, results[name], episodes, EXPECTED_CRITERION) for name in POLICIES
+        name: _validate_run(name, results[name], episodes, criterion, task_ids) for name in POLICIES
     }
     paired_trials: list[dict[str, Any]] = []
     maximum_difference = 0.0
@@ -195,17 +225,28 @@ def compare(
         steps = {trial["steps"] for trial in trials.values()}
         if len(steps) != 1:
             raise ValueError(f"Condition {index}: episode horizon differs: {steps}")
-        differences = {
-            f"{left}_vs_{right}": _state_difference(
-                trials[left]["initial_state"],
-                trials[right]["initial_state"],
-                path=f"condition[{index}].{left}_vs_{right}",
-            )
-            for left, right in PAIR_NAMES
-        }
+        differences = {}
+        for left, right in PAIR_NAMES:
+            pair = f"{left}_vs_{right}"
+            left_state = trials[left]["initial_state"]
+            right_state = trials[right]["initial_state"]
+            if left_state.keys() != right_state.keys():
+                raise ValueError(f"Condition {index}: initial-state fields differ for {pair}")
+            field_differences = {
+                field: _state_difference(left_state[field], right_state[field], path=f"condition[{index}].{pair}.{field}")
+                for field in left_state
+            }
+            if benchmark == "gear_mesh":
+                violations = {
+                    field: diff for field, diff in field_differences.items()
+                    if diff > GEAR_STATE_TOLERANCES.get(field, state_atol)
+                }
+                if violations:
+                    raise ValueError(f"Condition {index} seed {trials[left]['condition_seed']}: {pair} state violations: {violations}")
+            differences[pair] = max(field_differences.values(), default=0.0)
         difference = max(differences.values())
         maximum_difference = max(maximum_difference, difference)
-        if difference > state_atol:
+        if benchmark == "peg_insert" and difference > state_atol:
             raise ValueError(
                 f"Condition {index} seed {next(iter(seeds))}: initial states differ by "
                 f"{difference:.9g} > {state_atol:.9g}; no trials were dropped"
@@ -257,8 +298,9 @@ def compare(
         "strictly_paired": True,
         "paired_trials": episodes,
         "condition_seed_start": CONDITION_SEED_START,
-        "success_criterion": EXPECTED_CRITERION,
+        "success_criterion": criterion,
         "state_atol": state_atol,
+        "state_tolerances": GEAR_STATE_TOLERANCES if benchmark == "gear_mesh" else None,
         "max_initial_state_abs_difference": maximum_difference,
         "policies": summaries,
         "pairwise": pairs,
@@ -272,12 +314,14 @@ def main() -> None:
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--state-atol", type=float, default=1.0e-5)
+    parser.add_argument("--benchmark", choices=("peg_insert", "gear_mesh"), default="peg_insert")
+    parser.add_argument("--episodes", type=int, default=500)
     args = parser.parse_args()
     results = {}
     for name in POLICIES:
         with getattr(args, name).expanduser().open(encoding="utf-8") as file:
             results[name] = json.load(file)
-    comparison = compare(results, state_atol=args.state_atol)
+    comparison = compare(results, episodes=args.episodes, state_atol=args.state_atol, benchmark=args.benchmark)
     output = args.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp")
@@ -285,7 +329,7 @@ def main() -> None:
         json.dump(comparison, file, indent=2, allow_nan=False)
     temporary.replace(output)
     print(json.dumps({key: value for key, value in comparison.items() if key != "trials"}, indent=2))
-    print(f"[INFO] Strict 500-condition comparison saved to: {output}")
+    print(f"[INFO] Strict {args.episodes}-condition comparison saved to: {output}")
 
 
 if __name__ == "__main__":

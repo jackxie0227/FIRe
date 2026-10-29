@@ -92,6 +92,16 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     task: FactoryTask = FactoryTask()
     obs_rand: ObsRandCfg = ObsRandCfg()
     ctrl: CtrlCfg = CtrlCfg()
+    table_translation: tuple[float, float, float] = (0.55, 0.0, 0.0)
+    arm_joint_names: list[str] = [f"panda_joint{i}" for i in range(1, 8)]
+    gripper_joint_names: list[str] = ["panda_finger_joint1", "panda_finger_joint2"]
+    left_finger_body_name: str = "panda_leftfinger"
+    right_finger_body_name: str = "panda_rightfinger"
+    fingertip_body_name: str = "panda_fingertip_centered"
+    tcp_offset_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    tcp_offset_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    reset_ik_pos_tolerance: float = 1e-3
+    reset_ik_rot_tolerance: float = 1e-3
 
     episode_length_s = 10.0  # Probably need to override.
     sim: SimulationCfg = SimulationCfg(

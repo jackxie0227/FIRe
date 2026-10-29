@@ -163,7 +163,21 @@ class ForgeTaskGearMeshGr00tCfg(ForgeGr00tEnvCfg):
     task_name = "gear_mesh"
     task = ForgeGr00tGearMesh()
     episode_length_s = 20.0
-    
+
+
+@configclass
+class ForgeTaskGearMeshFIRe6DCfg(ForgeTaskGearMeshGr00tCfg):
+    """Opt-in GearMesh residual policy with exact GR00T pose chunks."""
+
+    action_space: int = 6
+    residual_action_limit: float = 1.0
+    strict_gr00t_response: bool = True
+    refresh_vla_on_episode_reset: bool = True
+    rerender_on_reset: bool = True
+
+    def __post_init__(self):
+        self.sim.render_interval = self.decimation
+
 
 @configclass
 class ForgeTaskNutThreadGr00tCfg(ForgeGr00tEnvCfg):

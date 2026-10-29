@@ -105,6 +105,7 @@ class ForgeEnvCfg(FactoryEnvCfg):
     events: EventCfg = EventCfg()
 
     ft_smoothing_factor: float = 0.25
+    force_sensor_body_name: str = "force_sensor"
 
     obs_order: list = [
         "fingertip_pos_rel_fixed",

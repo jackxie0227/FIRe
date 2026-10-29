@@ -1,0 +1,1 @@
+"""Forge task package scaffold."""
