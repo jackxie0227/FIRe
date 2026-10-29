@@ -101,6 +101,7 @@ from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 
 from isaaclab_rl.rl_games import MultiObserver, PbtAlgoObserver, RlGamesGpuEnv, RlGamesVecEnvWrapper
+from fire_lab.utils.rl_games_success_observer import FireSuccessObserver
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -116,6 +117,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     # Keep the persisted agent configuration consistent with the runtime actor count.
     agent_cfg["params"]["config"]["num_actors"] = env_cfg.scene.num_envs
+    agent_cfg["params"]["config"]["fire_task_id"] = args_cli.task
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
         raise ValueError(
@@ -278,11 +280,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
     # create runner from rl-games
 
+    success_checkpoint_cfg = agent_cfg["params"]["config"].get("success_checkpoint", {})
+    base_observer = (
+        FireSuccessObserver(agent_cfg)
+        if success_checkpoint_cfg.get("enabled", False)
+        else IsaacAlgoObserver()
+    )
     if "pbt" in agent_cfg and agent_cfg["pbt"]["enabled"]:
-        observers = MultiObserver([IsaacAlgoObserver(), PbtAlgoObserver(agent_cfg, args_cli)])
+        observers = MultiObserver([base_observer, PbtAlgoObserver(agent_cfg, args_cli)])
         runner = Runner(observers)
     else:
-        runner = Runner(IsaacAlgoObserver())
+        runner = Runner(base_observer)
 
     runner.load(agent_cfg)
 
@@ -312,6 +320,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.run({"train": True, "play": False, "sigma": train_sigma, "checkpoint": resume_path})
     else:
         runner.run({"train": True, "play": False, "sigma": train_sigma})
+
+    writer = getattr(runner.algo_observer, "writer", None)
+    if writer is not None:
+        writer.flush()
 
     # close the simulator
     env.close()

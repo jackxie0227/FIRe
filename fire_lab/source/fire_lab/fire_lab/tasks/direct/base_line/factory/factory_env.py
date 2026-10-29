@@ -14,7 +14,7 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import axis_angle_from_quat
+from isaaclab.utils.math import axis_angle_from_quat, quat_apply, skew_symmetric_matrix
 
 from . import factory_control, factory_utils
 from .factory_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG, FactoryEnvCfg
@@ -61,15 +61,21 @@ class FactoryEnv(DirectRLEnv):
         self.ctrl_target_joint_pos = torch.zeros((self.num_envs, self._robot.num_joints), device=self.device)
         self.ema_factor = self.cfg.ctrl.ema_factor
         self.dead_zone_thresholds = None
+        self.arm_joint_ids, _ = self._robot.find_joints(self.cfg.arm_joint_names)
+        self.gripper_joint_ids, _ = self._robot.find_joints(self.cfg.gripper_joint_names)
+        if len(self.arm_joint_ids) != 7 or len(self.gripper_joint_ids) != 2:
+            raise RuntimeError("Factory robot must provide seven arm and two gripper joints")
 
         # Fixed asset.
         self.fixed_pos_obs_frame = torch.zeros((self.num_envs, 3), device=self.device)
         self.init_fixed_pos_obs_noise = torch.zeros((self.num_envs, 3), device=self.device)
 
         # Computer body indices.
-        self.left_finger_body_idx = self._robot.body_names.index("panda_leftfinger")
-        self.right_finger_body_idx = self._robot.body_names.index("panda_rightfinger")
-        self.fingertip_body_idx = self._robot.body_names.index("panda_fingertip_centered")
+        self.left_finger_body_idx = self._robot.body_names.index(self.cfg.left_finger_body_name)
+        self.right_finger_body_idx = self._robot.body_names.index(self.cfg.right_finger_body_name)
+        self.fingertip_body_idx = self._robot.body_names.index(self.cfg.fingertip_body_name)
+        self.tcp_offset_pos = torch.tensor(self.cfg.tcp_offset_pos, device=self.device).repeat(self.num_envs, 1)
+        self.tcp_offset_quat = torch.tensor(self.cfg.tcp_offset_quat, device=self.device).repeat(self.num_envs, 1)
 
         # Tensors for finite-differencing.
         self.last_update_timestamp = 0.0  # Note: This is for finite differencing body velocities.
@@ -89,7 +95,7 @@ class FactoryEnv(DirectRLEnv):
         # spawn a usd file of a table into the scene
         cfg = sim_utils.UsdFileCfg(usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/SeattleLabTable/table_instanceable.usd")
         cfg.func(
-            "/World/envs/env_.*/Table", cfg, translation=(0.55, 0.0, 0.0), orientation=(0.70711, 0.0, 0.0, 0.70711)
+            "/World/envs/env_.*/Table", cfg, translation=self.cfg.table_translation, orientation=(0.70711, 0.0, 0.0, 0.70711)
         )
 
         self._robot = Articulation(self.cfg.robot)
@@ -124,17 +130,29 @@ class FactoryEnv(DirectRLEnv):
         self.held_pos = self._held_asset.data.root_pos_w - self.scene.env_origins
         self.held_quat = self._held_asset.data.root_quat_w
 
-        self.fingertip_midpoint_pos = self._robot.data.body_pos_w[:, self.fingertip_body_idx] - self.scene.env_origins
-        self.fingertip_midpoint_quat = self._robot.data.body_quat_w[:, self.fingertip_body_idx]
-        self.fingertip_midpoint_linvel = self._robot.data.body_lin_vel_w[:, self.fingertip_body_idx]
+        body_pos = self._robot.data.body_pos_w[:, self.fingertip_body_idx] - self.scene.env_origins
+        body_quat = self._robot.data.body_quat_w[:, self.fingertip_body_idx]
+        self.fingertip_midpoint_quat, self.fingertip_midpoint_pos = torch_utils.tf_combine(
+            body_quat, body_pos, self.tcp_offset_quat, self.tcp_offset_pos
+        )
+        tcp_offset_world = quat_apply(body_quat, self.tcp_offset_pos)
+        self.fingertip_midpoint_linvel = self._robot.data.body_lin_vel_w[:, self.fingertip_body_idx] + torch.cross(
+            self._robot.data.body_ang_vel_w[:, self.fingertip_body_idx], tcp_offset_world, dim=-1
+        )
         self.fingertip_midpoint_angvel = self._robot.data.body_ang_vel_w[:, self.fingertip_body_idx]
 
         jacobians = self._robot.root_physx_view.get_jacobians()
-
-        self.left_finger_jacobian = jacobians[:, self.left_finger_body_idx - 1, 0:6, 0:7]
-        self.right_finger_jacobian = jacobians[:, self.right_finger_body_idx - 1, 0:6, 0:7]
+        body_offset = 1 if self._robot.is_fixed_base else 0
+        joint_offset = 0 if self._robot.is_fixed_base else 6
+        jacobian_joint_ids = [joint_id + joint_offset for joint_id in self.arm_joint_ids]
+        self.left_finger_jacobian = jacobians[:, self.left_finger_body_idx - body_offset, :, jacobian_joint_ids]
+        self.right_finger_jacobian = jacobians[:, self.right_finger_body_idx - body_offset, :, jacobian_joint_ids]
         self.fingertip_midpoint_jacobian = (self.left_finger_jacobian + self.right_finger_jacobian) * 0.5
-        self.arm_mass_matrix = self._robot.root_physx_view.get_generalized_mass_matrices()[:, 0:7, 0:7]
+        self.fingertip_midpoint_jacobian[:, 0:3] -= (
+            skew_symmetric_matrix(tcp_offset_world) @ self.fingertip_midpoint_jacobian[:, 3:6]
+        )
+        mass_matrices = self._robot.root_physx_view.get_generalized_mass_matrices()
+        self.arm_mass_matrix = mass_matrices[:, self.arm_joint_ids][:, :, self.arm_joint_ids]
         self.joint_pos = self._robot.data.joint_pos.clone()
         self.joint_vel = self._robot.data.joint_vel.clone()
 
@@ -151,9 +169,9 @@ class FactoryEnv(DirectRLEnv):
         self.ee_angvel_fd = rot_diff_aa / dt
         self.prev_fingertip_quat = self.fingertip_midpoint_quat.clone()
 
-        joint_diff = self.joint_pos[:, 0:7] - self.prev_joint_pos
+        joint_diff = self.joint_pos[:, self.arm_joint_ids] - self.prev_joint_pos
         self.joint_vel_fd = joint_diff / dt
-        self.prev_joint_pos = self.joint_pos[:, 0:7].clone()
+        self.prev_joint_pos = self.joint_pos[:, self.arm_joint_ids].clone()
 
         self.last_update_timestamp = self._robot._data._sim_timestamp
 
@@ -178,7 +196,7 @@ class FactoryEnv(DirectRLEnv):
             "fingertip_quat": self.fingertip_midpoint_quat,
             "ee_linvel": self.fingertip_midpoint_linvel,
             "ee_angvel": self.fingertip_midpoint_angvel,
-            "joint_pos": self.joint_pos[:, 0:7],
+            "joint_pos": self.joint_pos[:, self.arm_joint_ids],
             "held_pos": self.held_pos,
             "held_pos_rel_fixed": self.held_pos - self.fixed_pos_obs_frame,
             "held_quat": self.held_quat,
@@ -710,8 +728,8 @@ class FactoryEnv(DirectRLEnv):
                 ctrl_target_fingertip_midpoint_quat=hand_down_quat,
                 env_ids=bad_envs,
             )
-            pos_error = torch.linalg.norm(pos_error, dim=1) > 1e-3
-            angle_error = torch.norm(aa_error, dim=1) > 1e-3
+            pos_error = torch.linalg.norm(pos_error, dim=1) > self.cfg.reset_ik_pos_tolerance
+            angle_error = torch.norm(aa_error, dim=1) > self.cfg.reset_ik_rot_tolerance
             any_error = torch.logical_or(pos_error, angle_error)
             bad_envs = bad_envs[any_error.nonzero(as_tuple=False).squeeze(-1)]
 
@@ -719,11 +737,11 @@ class FactoryEnv(DirectRLEnv):
             if bad_envs.shape[0] == 0:
                 break
 
-            self._set_franka_to_default_pose(
-                joints=[0.00871, -0.10368, -0.00794, -1.49139, -0.00083, 1.38774, 0.0], env_ids=bad_envs
-            )
+            self._set_franka_to_default_pose(joints=self.cfg.ctrl.reset_joints, env_ids=bad_envs)
 
             ik_attempt += 1
+            if ik_attempt >= 8:
+                raise RuntimeError(f"Factory reset IK failed for {len(bad_envs)} environments after 8 attempts")
 
         self.step_sim_no_action()
 
@@ -800,12 +818,12 @@ class FactoryEnv(DirectRLEnv):
 
         grasp_time = 0.0
         while grasp_time < 0.25:
-            self.ctrl_target_joint_pos[env_ids, 7:] = 0.0  # Close gripper.
+            self.ctrl_target_joint_pos[env_ids[:, None], self.gripper_joint_ids] = 0.0  # Close gripper.
             self.close_gripper_in_place()
             self.step_sim_no_action()
             grasp_time += self.sim.get_physics_dt()
 
-        self.prev_joint_pos = self.joint_pos[:, 0:7].clone()
+        self.prev_joint_pos = self.joint_pos[:, self.arm_joint_ids].clone()
         self.prev_fingertip_pos = self.fingertip_midpoint_pos.clone()
         self.prev_fingertip_quat = self.fingertip_midpoint_quat.clone()
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run a one-batch GR00T N1 forward/backward smoke test on a FIRe dataset."""
+"""Run a finite forward/backward/optimizer smoke test on a FIRe GR00T dataset."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -16,7 +17,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embodiment-tag", default="franka")
     parser.add_argument("--video-backend", default="decord")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Accumulate this many micro-batches before each optimizer update.",
+    )
     parser.add_argument("--backward", action="store_true")
+    parser.add_argument(
+        "--optimizer-steps",
+        type=int,
+        default=0,
+        help="Run this many AdamW updates; implies --backward.",
+    )
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--optim",
+        choices=("adamw_torch", "adamw_bnb_8bit", "paged_adamw_8bit"),
+        default="adamw_torch",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--json-output", type=Path)
     parser.add_argument(
         "--hf-home",
         type=Path,
@@ -27,7 +49,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.optimizer_steps < 0:
+        raise ValueError("--optimizer-steps cannot be negative")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be positive")
+    run_backward = args.backward or args.optimizer_steps > 0
     os.environ.setdefault("HF_HOME", str(args.hf_home.resolve()))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str((args.hf_home / "transformers").resolve()))
     os.environ.setdefault("ALBUMENTATIONS_OFFLINE", "1")
 
     import torch
@@ -41,6 +71,10 @@ def main() -> None:
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+    torch.manual_seed(args.seed)
+    if args.device == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.reset_peak_memory_stats()
 
     config = DATA_CONFIG_MAP[args.data_config]
     transforms = config.transform()
@@ -52,40 +86,131 @@ def main() -> None:
         transforms=transforms,
     )
     collator = DefaultDataCollatorGR00T(transforms.transforms[-1].vlm_processor)
-    batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=collator)))
+    batch = next(
+        iter(DataLoader(dataset, batch_size=args.batch_size, num_workers=0, collate_fn=collator))
+    )
 
     model = GR00T_N1.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
         tune_llm=False,
         tune_visual=False,
-        tune_projector=args.backward,
-        tune_diffusion_model=args.backward,
+        tune_projector=run_backward,
+        tune_diffusion_model=run_backward,
     ).to(args.device)
     model.compute_dtype = "bfloat16"
     model.config.compute_dtype = "bfloat16"
-    model.train(args.backward)
+    model.train(run_backward)
 
-    context = torch.enable_grad() if args.backward else torch.inference_mode()
+    optimizer = None
+    parameter_probes = {}
+    if args.optimizer_steps:
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        optimizer_kwargs = {
+            "lr": args.learning_rate,
+            "betas": (0.95, 0.999),
+            "eps": 1e-8,
+            "weight_decay": 1e-5,
+        }
+        if args.optim == "adamw_torch":
+            optimizer = torch.optim.AdamW(trainable, **optimizer_kwargs)
+        else:
+            try:
+                import bitsandbytes as bnb
+            except ImportError as error:
+                raise RuntimeError(f"{args.optim} requires bitsandbytes") from error
+            optimizer_cls = (
+                bnb.optim.AdamW8bit
+                if args.optim == "adamw_bnb_8bit"
+                else bnb.optim.PagedAdamW8bit
+            )
+            optimizer = optimizer_cls(trainable, **optimizer_kwargs)
+        parameter_probes = {
+            name: parameter.detach().reshape(-1)[:16].float().cpu().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+
+    losses = []
+    gradient_tensors = 0
+    passes = max(1, args.optimizer_steps * args.gradient_accumulation_steps)
+    context = torch.enable_grad() if run_backward else torch.inference_mode()
     with context:
-        outputs = model(batch)
-        loss = outputs["loss"]
-        print(f"loss={float(loss.detach().cpu()):.8f}, finite={bool(torch.isfinite(loss))}")
-        if args.backward:
-            loss.backward()
-            gradients = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
-            if not gradients:
-                raise RuntimeError("Backward completed without producing trainable gradients")
-            gradients_finite = all(bool(torch.isfinite(gradient).all()) for gradient in gradients)
-            print(f"backward=true, gradient_tensors={len(gradients)}, finite={gradients_finite}")
-            if not gradients_finite:
-                raise RuntimeError("Backward produced NaN or Inf gradients")
+        for step in range(passes):
+            accumulation_index = step % args.gradient_accumulation_steps
+            if optimizer is not None and accumulation_index == 0:
+                optimizer.zero_grad(set_to_none=True)
+            outputs = model(batch)
+            loss = outputs["loss"]
+            loss_value = float(loss.detach().cpu())
+            losses.append(loss_value)
+            loss_finite = bool(torch.isfinite(loss))
+            print(f"step={step + 1}, loss={loss_value:.8f}, finite={loss_finite}")
+            if not loss_finite:
+                raise RuntimeError("Forward produced a NaN or Inf loss")
+            if run_backward:
+                (loss / args.gradient_accumulation_steps).backward()
+                gradients = [
+                    parameter.grad
+                    for parameter in model.parameters()
+                    if parameter.requires_grad and parameter.grad is not None
+                ]
+                if not gradients:
+                    raise RuntimeError("Backward completed without producing trainable gradients")
+                gradient_tensors = len(gradients)
+                gradients_finite = all(bool(torch.isfinite(gradient).all()) for gradient in gradients)
+                print(
+                    f"backward=true, gradient_tensors={gradient_tensors}, "
+                    f"finite={gradients_finite}"
+                )
+                if not gradients_finite:
+                    raise RuntimeError("Backward produced NaN or Inf gradients")
+            if optimizer is not None and accumulation_index + 1 == args.gradient_accumulation_steps:
+                optimizer.step()
 
-    if args.device == "cuda":
-        print(
-            f"cuda_peak_allocated_gib={torch.cuda.max_memory_allocated() / 2**30:.3f}, "
-            f"cuda_peak_reserved_gib={torch.cuda.max_memory_reserved() / 2**30:.3f}"
+    changed_parameter_tensors = 0
+    if optimizer is not None:
+        changed_parameter_tensors = sum(
+            not torch.equal(
+                parameter_probes[name],
+                parameter.detach().reshape(-1)[:16].float().cpu(),
+            )
+            for name, parameter in model.named_parameters()
+            if name in parameter_probes
         )
+        print(f"optimizer_steps={args.optimizer_steps}, changed_parameter_tensors={changed_parameter_tensors}")
+        if changed_parameter_tensors == 0:
+            raise RuntimeError("Optimizer steps did not change any probed trainable parameters")
+
+    peak_allocated_gib = None
+    peak_reserved_gib = None
+    if args.device == "cuda":
+        peak_allocated_gib = torch.cuda.max_memory_allocated() / 2**30
+        peak_reserved_gib = torch.cuda.max_memory_reserved() / 2**30
+        print(
+            f"cuda_peak_allocated_gib={peak_allocated_gib:.3f}, "
+            f"cuda_peak_reserved_gib={peak_reserved_gib:.3f}"
+        )
+
+    if args.json_output:
+        report = {
+            "status": "pass",
+            "dataset": str(args.dataset.resolve()),
+            "model": args.model,
+            "device": args.device,
+            "batch_size": args.batch_size,
+            "effective_batch_size": args.batch_size * args.gradient_accumulation_steps,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "optimizer_steps": args.optimizer_steps,
+            "optim": args.optim,
+            "losses": losses,
+            "gradient_tensors": gradient_tensors,
+            "changed_parameter_tensors": changed_parameter_tensors,
+            "cuda_peak_allocated_gib": peak_allocated_gib,
+            "cuda_peak_reserved_gib": peak_reserved_gib,
+        }
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        args.json_output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

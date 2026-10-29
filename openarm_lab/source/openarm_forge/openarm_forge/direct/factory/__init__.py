@@ -1,0 +1,1 @@
+"""Factory task package scaffold."""
