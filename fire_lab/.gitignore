@@ -63,6 +63,12 @@ _build
 **/logs/*
 **/recordings/*
 
+# Track per-run analysis reports, but keep raw training artifacts ignored.
+!/logs/
+/logs/**
+!/logs/**/
+!/logs/**/analysis.md
+
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
 
